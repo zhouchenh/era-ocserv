@@ -153,6 +153,68 @@ func TestStage1InnerSourceSpoofDropped(t *testing.T) {
 	}
 }
 
+// TestStage1GracefulShutdownSendsTermServer covers P1 #2: on
+// Server.Close, the gateway must send TERM_SERVER (frame type 9 per
+// spec §1.5) on each accepted tunnel so the client knows the
+// disconnect is server-initiated and not retryable.
+//
+// We give the test a long DPD / keepalive so that DPD/keepalive
+// frames do not race the TERM_SERVER. The client reads frames until
+// it sees TERM_SERVER or hits the deadline.
+func TestStage1GracefulShutdownSendsTermServer(t *testing.T) {
+	h := newHarness(t, withDPDInterval(3600), withKeepaliveInterval(3600))
+	clientCert := h.pk.issueClientLeaf(t, canonicalDeviceID)
+	client := &fakeClient{addr: h.Address(), tlsConfig: h.pk.clientTLSConfig(clientCert)}
+	if err := client.dial(); err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.close()
+
+	token, _, _, err := client.initAndAuth("vpn.eracloud.app", "alice", "hunter2")
+	if err != nil {
+		t.Fatalf("initAndAuth: %v", err)
+	}
+	if _, err := client.connect("vpn.eracloud.app", token); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	// Trigger graceful server shutdown after the client's readFrame
+	// is already blocking on the conn.
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		h.Close()
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	var sawTermServer bool
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		typ, _, err := client.readFrameWithDeadline(remaining)
+		if err != nil {
+			// Connection closed; bail out and fail below if we never
+			// saw TERM_SERVER.
+			break
+		}
+		if typ == cstpPktTermServer {
+			sawTermServer = true
+			break
+		}
+		// Filter out unrelated frames; with DPD/keepalive=3600s
+		// nothing else should arrive in practice.
+	}
+	if !sawTermServer {
+		t.Fatalf("expected TERM_SERVER frame on graceful shutdown, got none")
+	}
+}
+
+// cstpPktTermServer mirrors internal/cstp's pktTermServer constant.
+// Duplicated because internal/cstp's frame.go is package-private; the
+// e2e tests cannot import it directly.
+const cstpPktTermServer byte = 9
+
 // TestStage1DTLSAdvertisedWhenEnabled covers P1 #1 + P1 #5: when
 // Config.DTLSAdvertise is true AND the client offered the locked
 // AES128-GCM-SHA256 cipher, the gateway emits X-DTLS-* headers with

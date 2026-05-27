@@ -161,6 +161,16 @@ type Server struct {
 	closeCh chan struct{}
 	closeMu sync.Mutex
 	closed  bool
+
+	// active tracks every tunnel that has been published to a caller
+	// via Accept and has not yet been observed closed. Server.Close
+	// walks this set and sends TERM_SERVER on each so the client
+	// knows the disconnect is server-initiated and not retryable
+	// (spec §1.5 frame type 9). Mutex guards both the map and the
+	// "closed" flag (above) so register/unregister stays consistent
+	// with the close sweep.
+	activeMu sync.Mutex
+	active   map[*Tunnel]struct{}
 }
 
 // NewServer builds a Server with the supplied configuration. Required
@@ -174,6 +184,7 @@ func NewServer(cfg Config) *Server {
 		sessions: newSessionTable(cfg.SessionTimeout, cfg.Now),
 		tunnels:  make(chan *Tunnel, 32),
 		closeCh:  make(chan struct{}),
+		active:   make(map[*Tunnel]struct{}),
 	}
 }
 
@@ -195,19 +206,113 @@ func (s *Server) Accept(ctx context.Context) (*Tunnel, error) {
 	}
 }
 
-// Close stops accepting new tunnels. Tunnels that have already been
-// handed to Accept callers are left intact and must be Close'd by
-// their owners. Close is idempotent.
+// Close stops accepting new tunnels and tears down every active
+// tunnel. On each active tunnel we send a TERM_SERVER frame (spec
+// §1.5 type 9) so the client knows the disconnect is server-
+// initiated and not retryable; the tunnel is then closed
+// idempotently. Close itself is idempotent.
+//
+// Without this teardown, http.Server.Shutdown does not affect
+// hijacked connections (documented Go runtime behaviour) and tunnel
+// goroutines would be abandoned mid-write on SIGTERM; observed-state
+// from the client side would be a hang rather than a clean
+// disconnect. Wave-1 review P1 #2.
+//
+// We deliberately do not close the s.tunnels channel. Closing it
+// would race with a concurrent handleConnect that already lost the
+// select-race against closeCh and is in the act of sending; Go would
+// panic on the close. Closing closeCh is enough: it unblocks Accept
+// (returns ErrServerClosed) and signals registerTunnel to reject new
+// tunnels.
 func (s *Server) Close() error {
+	// Take activeMu while marking closed so any concurrent
+	// registerTunnel either sees closed=false (and is in the
+	// snapshot we sweep below) or sees closed=true (and returns
+	// false). Without this ordering, a register that runs between
+	// "mark closed" and "snapshot active" leaks the tunnel.
+	s.activeMu.Lock()
 	s.closeMu.Lock()
-	defer s.closeMu.Unlock()
 	if s.closed {
+		s.closeMu.Unlock()
+		s.activeMu.Unlock()
 		return nil
 	}
 	s.closed = true
 	close(s.closeCh)
-	close(s.tunnels)
+	s.closeMu.Unlock()
+	s.activeMu.Unlock()
+
+	// Drain anything sitting in the accept channel that has not yet
+	// been picked up by a caller. These tunnels are already in
+	// s.active (newTunnel registers before publishing) so the
+	// active-set sweep below would also tear them down, but draining
+	// here keeps the channel empty so we don't leave dangling
+	// references for the GC.
+drain:
+	for {
+		select {
+		case <-s.tunnels:
+			// Tunnel is in s.active; teardownTunnel happens in the
+			// sweep below.
+		default:
+			break drain
+		}
+	}
+
+	// Take a snapshot of active tunnels under the lock; release the
+	// lock before issuing any I/O so a tunnel's own goroutine can
+	// still call unregisterTunnel without deadlocking.
+	s.activeMu.Lock()
+	snapshot := make([]*Tunnel, 0, len(s.active))
+	for t := range s.active {
+		snapshot = append(snapshot, t)
+	}
+	s.activeMu.Unlock()
+
+	for _, t := range snapshot {
+		s.teardownTunnel(t)
+	}
 	return nil
+}
+
+// teardownTunnel sends a best-effort TERM_SERVER frame, then closes
+// the tunnel. Both calls are idempotent; either may fail silently if
+// the peer has already disappeared.
+func (s *Server) teardownTunnel(t *Tunnel) {
+	// Single-byte payload of zero matches what ocserv emits on
+	// shutdown. Some clients log the payload; an empty one would
+	// also work but is unconventional.
+	_ = t.writeFrame(pktTermServer, []byte{0})
+	_ = t.Close()
+}
+
+// registerTunnel records a tunnel in the active set. Called from
+// newTunnel before the tunnel is published to s.tunnels. If the
+// server is mid-close we skip registration and return false; the
+// caller closes the tunnel immediately. The closed check and the
+// map mutation happen under the same lock so a register that races
+// with Close either adds to the set that Close is about to sweep,
+// or returns false.
+func (s *Server) registerTunnel(t *Tunnel) bool {
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	s.closeMu.Lock()
+	closed := s.closed
+	s.closeMu.Unlock()
+	if closed {
+		return false
+	}
+	s.active[t] = struct{}{}
+	return true
+}
+
+// unregisterTunnel drops a tunnel from the active set. Called by the
+// tunnel itself once readLoop / heartbeatLoop has observed close.
+// Tolerates a tunnel that was never registered (race with Close).
+func (s *Server) unregisterTunnel(t *Tunnel) {
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	delete(s.active, t)
 }
 
 // ErrServerClosed is returned by Accept once Close has been called.

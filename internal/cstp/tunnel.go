@@ -82,6 +82,10 @@ var errClientDisconnect = errors.New("cstp: client requested disconnect")
 // the reader + heartbeat goroutines. The bufio.ReadWriter handed to
 // us by hijack already contains the post-CONNECT bytes the http server
 // buffered; we reuse it to avoid losing those bytes.
+//
+// The tunnel registers itself with the Server's active set so that
+// Server.Close can send TERM_SERVER on it. The corresponding
+// unregister happens in closeWithErr.
 func (s *Server) newTunnel(conn net.Conn, rw *bufio.ReadWriter, id Identity, sessionToken string) *Tunnel {
 	now := s.now()
 	t := &Tunnel{
@@ -100,6 +104,15 @@ func (s *Server) newTunnel(conn net.Conn, rw *bufio.ReadWriter, id Identity, ses
 	}
 	t.lastInbound.Store(now.UnixNano())
 	t.lastOutbound.Store(now.UnixNano())
+
+	if !s.registerTunnel(t) {
+		// Server is already mid-close; the caller should not start
+		// the read/heartbeat goroutines. Return a tunnel that's
+		// already closed so ReadPacket / WritePacket immediately
+		// surface the closed state.
+		_ = t.closeWithErr(ErrServerClosed)
+		return t
+	}
 
 	go t.readLoop()
 	go t.heartbeatLoop()
@@ -159,6 +172,9 @@ func (t *Tunnel) closeWithErr(cause error) error {
 		}
 		close(t.closeCh)
 		_ = t.conn.Close()
+		if t.server != nil {
+			t.server.unregisterTunnel(t)
+		}
 	})
 	return nil
 }

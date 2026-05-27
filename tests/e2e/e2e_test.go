@@ -280,13 +280,24 @@ func TestStage1GracefulShutdownClosesTunnel(t *testing.T) {
 	// Drive the shutdown.
 	h.Close()
 
-	// Subsequent client reads must fail. We give it 2s to notice.
+	// On graceful shutdown the gateway sends a TERM_SERVER frame
+	// (P1 #2 from the wave-1 review) BEFORE closing the conn, so a
+	// single Read may successfully return the frame bytes before the
+	// conn dies. Loop-read with a deadline until a read fails; the
+	// invariant we care about is "the conn is dead within 2s".
 	if err := client.conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
 	}
 	buf := make([]byte, 1024)
-	_, err = client.conn.Read(buf)
-	if err == nil {
+	var sawErr bool
+	for {
+		_, rerr := client.conn.Read(buf)
+		if rerr != nil {
+			sawErr = true
+			break
+		}
+	}
+	if !sawErr {
 		t.Fatalf("expected client read to fail after shutdown")
 	}
 	// We tolerate any non-nil error: io.EOF, net.ErrClosed, "use of
