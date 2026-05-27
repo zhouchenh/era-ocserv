@@ -68,6 +68,16 @@ type Identity struct {
 	// MTU is the inner-frame MTU advertised via X-CSTP-MTU. If zero the
 	// server falls back to Config.DefaultMTU.
 	MTU int
+	// DNS, if non-empty, overrides Config.DNS for this specific
+	// device — emitted as repeated X-CSTP-DNS headers. Empty means
+	// use the gateway-wide default. (Wired through from iam.Identity.DNS;
+	// preserves the future per-device override path documented in
+	// internal/iam/iam.go.)
+	DNS []netip.Addr
+	// DefaultDomain, if non-empty, overrides Config.DefaultDomain
+	// for this specific device. Empty means use the gateway-wide
+	// default; empty in both means do not emit the header.
+	DefaultDomain string
 }
 
 // Config is the construction-time configuration for a CSTP Server. All

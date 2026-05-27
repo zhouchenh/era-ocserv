@@ -127,9 +127,20 @@ func (t *Tunnel) Identity() Identity { return t.identity }
 // tunnel. Used by the caller for logging / audit correlation.
 func (t *Tunnel) SessionID() string { return t.sessionID }
 
-// ReadPacket reads the next inbound data-frame payload into p, returns
-// (n, nil) on success or (0, err) on close / error. The returned
-// payload is a raw IP packet ready to write to a tun device.
+// ReadPacket reads the next inbound data-frame payload into p,
+// returns (n, nil) on success, (n, io.ErrShortBuffer) when the
+// payload exceeds len(p) (the first n bytes are written into p; the
+// trailing bytes are dropped), or (0, err) on close / error. The
+// returned payload is a raw IP packet ready to write to a tun
+// device.
+//
+// Truncation contract: callers that pass a buffer smaller than the
+// largest possible payload will see io.ErrShortBuffer rather than a
+// silent drop. This is intentionally different from
+// tun.Queue.Read, which silently truncates with no signal; if you
+// migrate code between the two paths, audit how you observe
+// truncation. The bridge in internal/bridge sizes its scratch buffer
+// to 65535 to make ErrShortBuffer impossible in practice.
 func (t *Tunnel) ReadPacket(p []byte) (int, error) {
 	select {
 	case pkt, ok := <-t.dataCh:

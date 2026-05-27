@@ -139,9 +139,20 @@ func (d *Device) Close() error {
 }
 
 // Read pulls one IP packet from the queue into p. The returned length is the
-// number of bytes written into p. If p is shorter than the next packet, Linux
-// truncates and the trailing bytes are lost — callers should size buffers to
-// at least the device MTU.
+// number of bytes written into p.
+//
+// Truncation contract: if p is shorter than the next packet, Linux silently
+// truncates and the trailing bytes are LOST. There is no error signal — the
+// caller gets (len(p), nil) and cannot tell a truncated packet from a fully-
+// received one of the same length. Callers MUST size p at least to the device
+// MTU (typically 1500) and ideally to the worst-case CSTP/DTLS inner MTU
+// (~1406) plus headroom. The bridge in internal/bridge sizes its scratch
+// buffer to 65535 to make truncation impossible in practice.
+//
+// This contrasts with cstp.Tunnel.ReadPacket which returns the partial
+// payload plus io.ErrShortBuffer on truncation; if you migrate code between
+// the two paths, the silent-vs-signalled-truncation difference is
+// load-bearing.
 //
 // Read returns os.ErrClosed after Close. EINTR is retried transparently.
 func (q *Queue) Read(p []byte) (int, error) {

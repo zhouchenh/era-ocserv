@@ -231,18 +231,35 @@ func TestHTTPVerifier_Timeout(t *testing.T) {
 }
 
 func TestHTTPVerifier_NotConfigured(t *testing.T) {
-	v := NewHTTPVerifier(HTTPVerifierConfig{})
-	_, err := v.Verify(context.Background(), "alice", "p")
-	if !errors.Is(err, ErrUpstream) {
-		t.Fatalf("Verify(no base url): err = %v, want ErrUpstream", err)
-	}
-
-	v2 := NewHTTPVerifier(HTTPVerifierConfig{
-		BaseURL: mustParseURL(t, "https://example.invalid"),
+	// Per the symmetric "fail fast at construction" contract with
+	// iam.NewTPMResolver (wave-1 review API-smell #2), missing
+	// required fields panic rather than degrade to runtime errors.
+	t.Run("nil base url panics", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic on nil BaseURL")
+			}
+		}()
+		_ = NewHTTPVerifier(HTTPVerifierConfig{})
 	})
-	_, err = v2.Verify(context.Background(), "alice", "p")
-	if !errors.Is(err, ErrUpstream) {
-		t.Fatalf("Verify(no token): err = %v, want ErrUpstream", err)
+
+	t.Run("empty service token panics", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic on empty ServiceToken")
+			}
+		}()
+		_ = NewHTTPVerifier(HTTPVerifierConfig{
+			BaseURL: mustParseURL(t, "https://example.invalid"),
+		})
+	})
+
+	// A nil HTTPVerifier receiver still surfaces ErrUpstream rather
+	// than panicking, so callers that hold a *HTTPVerifier in a
+	// nillable field do not crash.
+	var v *HTTPVerifier
+	if _, err := v.Verify(context.Background(), "a", "b"); !errors.Is(err, ErrUpstream) {
+		t.Fatalf("nil-receiver Verify: err = %v, want ErrUpstream", err)
 	}
 }
 

@@ -252,9 +252,11 @@ func (r resolverAdapter) Resolve(ctx context.Context, deviceID string) (cstp.Ide
 		return cstp.Identity{}, err
 	}
 	return cstp.Identity{
-		DeviceID: id.DeviceID,
-		IPv6:     id.IPv6,
-		MTU:      id.MTU,
+		DeviceID:      id.DeviceID,
+		IPv6:          id.IPv6,
+		MTU:           id.MTU,
+		DNS:           id.DNS,
+		DefaultDomain: id.DefaultDomain,
 	}, nil
 }
 

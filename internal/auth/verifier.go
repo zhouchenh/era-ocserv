@@ -65,23 +65,28 @@ const verifyPath = "/api/auth/ocserv/verify"
 const defaultHTTPTimeout = 5 * time.Second
 
 // NewHTTPVerifier returns an HTTPVerifier configured against cfg.
-// A nil BaseURL or empty ServiceToken still constructs the verifier;
-// the failure surfaces on the first Verify call as ErrUpstream so
-// caller startup wiring can choose to log or panic.
+//
+// Required fields (BaseURL, ServiceToken) panic when missing. This
+// matches the iam.NewTPMResolver "fail fast at startup" contract:
+// both are load-bearing for every call and silent fallback would
+// mask a wiring bug from the caller. Wave-1 review API-smell #2.
 func NewHTTPVerifier(cfg HTTPVerifierConfig) *HTTPVerifier {
+	if cfg.BaseURL == nil {
+		panic("auth: HTTPVerifierConfig.BaseURL is required")
+	}
+	if strings.TrimSpace(cfg.ServiceToken) == "" {
+		panic("auth: HTTPVerifierConfig.ServiceToken is required")
+	}
 	client := cfg.HTTPClient
 	if client == nil {
 		client = &http.Client{Timeout: defaultHTTPTimeout}
 	}
-	var endpoint *url.URL
-	if cfg.BaseURL != nil {
-		// Resolve verifyPath against the configured base so a base
-		// like ".../api/v1" is preserved; ResolveReference with a
-		// rooted ref replaces the base path, which is the documented
-		// contract anyway.
-		ref := &url.URL{Path: verifyPath}
-		endpoint = cfg.BaseURL.ResolveReference(ref)
-	}
+	// Resolve verifyPath against the configured base so a base like
+	// ".../api/v1" is preserved; ResolveReference with a rooted ref
+	// replaces the base path, which is the documented contract
+	// anyway.
+	ref := &url.URL{Path: verifyPath}
+	endpoint := cfg.BaseURL.ResolveReference(ref)
 	return &HTTPVerifier{
 		endpoint:     endpoint,
 		serviceToken: cfg.ServiceToken,
@@ -100,12 +105,14 @@ type verifyResponse struct {
 
 // Verify posts username + password to the era-portal auth-verify
 // endpoint and returns the device UUID on success.
+//
+// NewHTTPVerifier panics on missing endpoint / service token, so the
+// hot path here does not need defensive checks. A nil receiver is
+// still possible in tests that intentionally exercise the nil-deref
+// path; we treat it as ErrUpstream rather than panicking.
 func (h *HTTPVerifier) Verify(ctx context.Context, username, password string) (string, error) {
-	if h == nil || h.endpoint == nil {
+	if h == nil {
 		return "", fmt.Errorf("%w: verifier not configured", ErrUpstream)
-	}
-	if h.serviceToken == "" {
-		return "", fmt.Errorf("%w: service token not configured", ErrUpstream)
 	}
 
 	body, err := json.Marshal(verifyRequest{Username: username, Password: password})

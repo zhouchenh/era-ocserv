@@ -211,10 +211,22 @@ func emitCSTPHeaders(h http.Header, cfg Config, id Identity, innerMTU int) {
 	if cfg.ServerName != "" {
 		h.Set("X-CSTP-Hostname", cfg.ServerName)
 	}
-	if cfg.DefaultDomain != "" {
-		h.Set("X-CSTP-Default-Domain", cfg.DefaultDomain)
+	// Per-device DefaultDomain overrides the gateway-wide default.
+	// Empty in both means we do not emit the header at all.
+	domain := id.DefaultDomain
+	if domain == "" {
+		domain = cfg.DefaultDomain
 	}
-	for _, dns := range cfg.DNS {
+	if domain != "" {
+		h.Set("X-CSTP-Default-Domain", domain)
+	}
+	// Per-device DNS list overrides the gateway-wide default. We
+	// emit a repeated X-CSTP-DNS header per entry.
+	dnsList := id.DNS
+	if len(dnsList) == 0 {
+		dnsList = cfg.DNS
+	}
+	for _, dns := range dnsList {
 		h.Add("X-CSTP-DNS", dns.String())
 	}
 	for _, sp := range cfg.SplitInclude {

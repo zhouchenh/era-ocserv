@@ -16,6 +16,16 @@ type MockResolver struct {
 }
 
 // Set installs id under deviceID. It overwrites any prior value.
+//
+// Note: Set also overwrites id.DeviceID with the deviceID argument
+// before storing. This keeps a Resolve(deviceID) result internally
+// consistent (returned Identity.DeviceID always equals the lookup
+// key) even when the caller passed a zero-value or differing
+// DeviceID. Downstream tests
+// (TestMockResolver in mock_resolver_test.go,
+// e2e harness wiring in tests/e2e/harness_test.go) rely on this; do
+// NOT change the behaviour without auditing those call sites.
+// Wave-1 review API-smell #3 (docs/review/wave-1-stage-1.md).
 func (m *MockResolver) Set(deviceID string, id Identity) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
