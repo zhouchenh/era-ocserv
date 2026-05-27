@@ -84,10 +84,13 @@ func (s *Server) handleConn(ctx context.Context, conn *piondtls.Conn) {
 	defer s.active.Delete(conn)
 
 	// 3. Hand the data plane over. Subsequent tunnel.WritePacket calls
-	// now go out as DTLS frames on this conn. AttachDTLS returns nil
-	// if the Tunnel raced to close between the lookup above and the
-	// attach call — we drop cleanly in that case.
-	prev := tunnel.AttachDTLS(conn)
+	// now go out as DTLS frames on this conn. AttachDTLSWithCounter
+	// shares st.bytesOut with the Tunnel so the rekey byte budget
+	// catches outbound data writes too, not just the DPD-resp echoes
+	// this loop emits. AttachDTLS returns nil if the Tunnel raced to
+	// close between the lookup above and the attach call — we drop
+	// cleanly in that case.
+	prev := tunnel.AttachDTLSWithCounter(conn, &st.bytesOut)
 	if prev == nil {
 		s.log.Info("dtls tunnel closed during attach; aborting",
 			slog.String("session_id", redactSessionID(sessionID)))

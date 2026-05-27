@@ -89,9 +89,18 @@ type Tunnel struct {
 // pion/dtls *Conn (satisfying net.Conn). writeMu serializes
 // concurrent Write calls because the DTLS conn, like a TLS conn,
 // is not safe for parallel Write.
+//
+// bytesOut is an optional shared counter that, when non-nil, is
+// incremented by the full byte length of every outbound DTLS write.
+// The DTLS server installs the same *atomic.Uint64 it uses to enforce
+// the per-conn rekey byte budget so the budget catches both the
+// server-emitted DPD-resp frames and the Tunnel-emitted data frames.
+// If bytesOut is nil the Tunnel still works; the byte budget is
+// simply scoped to the DTLS server's inbound traffic.
 type dtlsAttachment struct {
-	conn    net.Conn
-	writeMu sync.Mutex
+	conn     net.Conn
+	writeMu  sync.Mutex
+	bytesOut *atomic.Uint64
 }
 
 // errCompressedFrame is returned to the caller via ReadPacket if the
@@ -210,6 +219,19 @@ func (t *Tunnel) WritePacket(p []byte) (int, error) {
 // server) drives reads itself and pushes inbound data frames through
 // InjectInbound.
 func (t *Tunnel) AttachDTLS(conn net.Conn) (prev net.Conn) {
+	return t.attachDTLSWithCounter(conn, nil)
+}
+
+// AttachDTLSWithCounter is the variant of AttachDTLS used by the
+// internal/dtls server. The supplied *atomic.Uint64 is incremented by
+// the full byte length of every outbound DTLS write the Tunnel
+// emits; the DTLS server uses the same counter to enforce the per-conn
+// rekey byte budget. Passing nil is equivalent to AttachDTLS.
+func (t *Tunnel) AttachDTLSWithCounter(conn net.Conn, bytesOut *atomic.Uint64) (prev net.Conn) {
+	return t.attachDTLSWithCounter(conn, bytesOut)
+}
+
+func (t *Tunnel) attachDTLSWithCounter(conn net.Conn, bytesOut *atomic.Uint64) (prev net.Conn) {
 	if conn == nil {
 		return nil
 	}
@@ -225,7 +247,8 @@ func (t *Tunnel) AttachDTLS(conn net.Conn) (prev net.Conn) {
 		return nil
 	default:
 	}
-	if old := t.dtls.Swap(&dtlsAttachment{conn: conn}); old != nil {
+	att := &dtlsAttachment{conn: conn, bytesOut: bytesOut}
+	if old := t.dtls.Swap(att); old != nil {
 		return old.conn
 	}
 	return t.conn
@@ -471,6 +494,9 @@ func (t *Tunnel) writeDTLSFrame(att *dtlsAttachment, typ byte, payload []byte) e
 
 	if _, err := att.conn.Write(buf); err != nil {
 		return err
+	}
+	if att.bytesOut != nil {
+		att.bytesOut.Add(uint64(len(buf)))
 	}
 	t.lastOutbound.Store(t.now().UnixNano())
 	return nil
