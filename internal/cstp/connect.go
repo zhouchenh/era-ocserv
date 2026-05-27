@@ -52,12 +52,16 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	// Try to derive a DTLS PSK from the outer TLS handshake. If the
 	// underlying conn isn't a *tls.Conn (test path, plain TCP), this
-	// silently downgrades to TCP-only CSTP.
+	// silently downgrades to TCP-only CSTP. The PSK is also only
+	// emitted on the response when (a) the caller has opted in to
+	// advertising DTLS at all, AND (b) the client offered PSK-NEGOTIATE
+	// in its X-DTLS-CipherSuite header — see protocol doc §2.2.
 	dtlsSecret, dtlsOK := deriveDTLSSecret(r)
+	advertise := dtlsOK && s.cfg.AdvertiseDTLS && clientOffersPSKNegotiate(r)
 
 	headers := w.Header()
 	emitCSTPHeaders(headers, s.cfg, id, innerMTU)
-	if dtlsOK {
+	if advertise {
 		emitDTLSHeaders(headers, dtlsSecret, innerMTU)
 	}
 
@@ -76,11 +80,12 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	s.sessions.consume(sess)
 	t := s.newTunnel(conn, rw, id, sess.token)
-	// Register the tunnel for DTLS lookup if we successfully derived
-	// a PSK from the outer TLS exporter; otherwise the DTLS channel
-	// silently stays unavailable for this session and the client
-	// uses CSTP-over-TLS for both control and data.
-	if dtlsOK {
+	// Register the tunnel for DTLS lookup if and only if we were also
+	// willing to advertise DTLS to this client. Otherwise the client
+	// will never attempt the DTLS handshake, so populating the lookup
+	// table only wastes memory and risks accepting an unsolicited UDP
+	// handshake from a peer that scraped the cookie elsewhere.
+	if advertise {
 		s.registerTunnel(sess.token, dtlsSecret, t)
 	}
 	select {
@@ -232,6 +237,28 @@ func emitDTLSHeaders(h http.Header, secret []byte, innerMTU int) {
 	if sid, err := randHex(nil, 32); err == nil {
 		h.Set("X-DTLS-Session-ID", sid)
 	}
+}
+
+// clientOffersPSKNegotiate returns true when the client's
+// X-DTLS-CipherSuite header includes the `PSK-NEGOTIATE` token,
+// matching what protocol doc §2.2 specifies as the only handshake
+// variant we support. We tolerate the header carrying a colon- or
+// comma-separated list of suites; we are also case-insensitive
+// because openconnect emits the token as `PSK-NEGOTIATE` while older
+// docs sometimes use `psk-negotiate`. If the header is absent the
+// client does not want DTLS and §2.2's degraded TCP-only mode kicks
+// in.
+func clientOffersPSKNegotiate(r *http.Request) bool {
+	for _, h := range r.Header.Values("X-DTLS-CipherSuite") {
+		for _, raw := range strings.FieldsFunc(h, func(r rune) bool {
+			return r == ':' || r == ',' || r == ' ' || r == '\t'
+		}) {
+			if strings.EqualFold(strings.TrimSpace(raw), "PSK-NEGOTIATE") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // deriveDTLSSecret pulls a 32-byte PSK from the outer TLS session

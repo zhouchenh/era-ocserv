@@ -135,6 +135,13 @@ func run() error {
 		KeepaliveInterval: 20,
 		IdleTimeout:       1800,
 		SessionTimeout:    24 * time.Hour,
+		// Only advertise X-DTLS-* on the CONNECT response when we are
+		// going to bind a UDP listener for the DTLS server below.
+		// Empty -listen-udp disables DTLS entirely; in that case the
+		// CSTP server should keep the AnyConnect TCP-only fallback
+		// path (protocol doc §2.2) rather than telling clients to try
+		// a UDP socket that will not answer.
+		AdvertiseDTLS: cfg.listenUDPAddr != "",
 	})
 
 	ln, err := net.Listen("tcp", cfg.listenAddr)

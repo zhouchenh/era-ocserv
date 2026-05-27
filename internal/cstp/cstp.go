@@ -98,6 +98,20 @@ type Config struct {
 	// window but bounded enough to avoid stale-cookie reuse.
 	SessionTimeout time.Duration
 
+	// AdvertiseDTLS gates the X-DTLS-* response header set on the CONNECT
+	// 200 CONNECTED. The DTLS data channel is only useful when a
+	// companion internal/dtls server is actually listening; advertising
+	// otherwise causes clients (especially macOS Cisco SC per protocol
+	// doc §3.2) to sit on a UDP timeout and then refuse to retry DTLS
+	// for the whole session. Stage 1 leaves this false; Stage 2 flips
+	// it true once the DTLS server is wired in cmd/era-ocserv/main.go.
+	//
+	// Even when this is true, X-DTLS-* headers are only emitted if the
+	// client offered PSK-NEGOTIATE in X-DTLS-CipherSuite (protocol doc
+	// §2.2 — degraded TCP-only mode is the supported fallback when the
+	// client does not opt in).
+	AdvertiseDTLS bool
+
 	// Now allows tests to inject a deterministic clock. Production
 	// leaves it nil and the package falls back to time.Now.
 	Now func() time.Time
