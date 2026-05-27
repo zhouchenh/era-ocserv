@@ -22,6 +22,7 @@ import (
 	"github.com/zhouchenh/era-ocserv/internal/auth"
 	"github.com/zhouchenh/era-ocserv/internal/certctx"
 	"github.com/zhouchenh/era-ocserv/internal/cstp"
+	"github.com/zhouchenh/era-ocserv/internal/dtlsuds"
 	"github.com/zhouchenh/era-ocserv/internal/iam"
 	"github.com/zhouchenh/era-ocserv/internal/tun"
 	"github.com/zhouchenh/era-ocserv/internal/udshandoff"
@@ -47,6 +48,13 @@ type config struct {
 	dnsServers    string
 	defaultDomain string
 	logLevel      string
+	// dtlsUDSSocket, when non-empty, enables the ADR-F7 Wave IV (stream O-S)
+	// AnyConnect-DTLS UDS DGRAM consumer alongside whichever CSTP listener
+	// the resolved -mode picks. era-facade decrypts DTLS upstream and hands
+	// the plaintext L3 packets over this socket; era-ocserv plumbs them
+	// into the same tun device the CSTP path uses. Pass 'default' to take
+	// dtlsuds.DefaultSocketPath. Empty disables (default).
+	dtlsUDSSocket string
 }
 
 func parseFlags() config {
@@ -72,7 +80,13 @@ func parseFlags() config {
 	flag.StringVar(&c.dnsServers, "dns", "2606:4700:4700::1111,2606:4700:4700::1001", "comma-separated DNS servers pushed via X-CSTP-DNS")
 	flag.StringVar(&c.defaultDomain, "default-domain", "", "DNS default domain pushed via X-CSTP-Default-Domain")
 	flag.StringVar(&c.logLevel, "log-level", "info", "log level: debug|info|warn|error")
+	flag.StringVar(&c.dtlsUDSSocket, "dtls-uds-socket", "",
+		"DTLS UDS DGRAM socket path (Wave IV O-S). Empty disables. "+
+			"Pass 'default' to use the canonical "+dtlsuds.DefaultSocketPath+".")
 	flag.Parse()
+	if c.dtlsUDSSocket == "default" {
+		c.dtlsUDSSocket = dtlsuds.DefaultSocketPath
+	}
 	return c
 }
 
@@ -202,6 +216,18 @@ func run() error {
 	br := newBridge(dev, srv)
 	go br.run(ctx)
 
+	dtlsListener, err := startDTLSListener(ctx, cfg, br, tpmResolver, dev)
+	if err != nil {
+		return fmt.Errorf("start dtls listener: %w", err)
+	}
+	defer func() {
+		if dtlsListener != nil {
+			if err := dtlsListener.Close(); err != nil {
+				slog.Warn("dtls listener close", "err", err)
+			}
+		}
+	}()
+
 	switch mode {
 	case modeUDS:
 		return runUDS(ctx, cfg, srv)
@@ -210,6 +236,38 @@ func run() error {
 	default:
 		return fmt.Errorf("unreachable: mode=%v", mode)
 	}
+}
+
+// startDTLSListener boots the AnyConnect-DTLS UDS DGRAM consumer when
+// -dtls-uds-socket is set (ADR-F7 Wave IV stream O-S). The listener
+// shares the same iam.Resolver and TUN device as the CSTP path and uses
+// the bridge as its session-lifecycle callback so the /128 lookup picks
+// the DTLS transport for outbound traffic. The DTLS listener runs
+// regardless of the CSTP -mode (uds or legacy) — DTLS termination always
+// happens at the facade in ADR-F7 Stage 5.
+//
+// Returns (nil, nil) when DTLS is disabled. Returns (nil, err) on bind
+// failure.
+func startDTLSListener(ctx context.Context, cfg config, br *bridge, resolver iam.Resolver, dev *tun.Device) (*dtlsuds.Listener, error) {
+	if cfg.dtlsUDSSocket == "" {
+		slog.Info("dtls listener disabled (no -dtls-uds-socket)")
+		return nil, nil
+	}
+	dtlsLogger := slog.Default().With(slog.String("component", "dtlsuds"))
+	metrics := udshandoff.NewMetrics()
+	l, err := dtlsuds.Listen(ctx, dtlsuds.Options{
+		SocketPath: cfg.dtlsUDSSocket,
+		Resolver:   resolver,
+		Sink:       newTunSink(dev),
+		Lifecycle:  br,
+		Logger:     dtlsLogger,
+		Metrics:    metrics,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dtlsuds.Listen: %w", err)
+	}
+	slog.Info("dtls listener bound", "socket", l.SocketPath())
+	return l, nil
 }
 
 // runUDS is the ADR-F7 Stage 2 path: era-facade hands us plaintext UDS
