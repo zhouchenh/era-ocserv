@@ -1,0 +1,31 @@
+[Unit]
+Description=ERA AnyConnect-compatible VPN gateway (era-ocserv; loopback behind era-facade)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/era-ocserv
+EnvironmentFile=/etc/era-ocserv/era-ocserv.env
+# All flags come from the environment file. ERA_OCSERV_ARGS is the single
+# variable an operator edits; era-ocserv-setup.sh ships a sample template.
+ExecStart=/opt/era-ocserv/era-ocserv $ERA_OCSERV_ARGS
+Restart=on-failure
+RestartSec=5s
+User=root
+# CAP_NET_ADMIN for tun create/up + addr+route program; CAP_NET_RAW for the
+# /dev/net/tun fd. NoNewPrivileges prevents capability re-acquisition.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# /var/lib/era-ocserv holds the setup marker; /var/log/era-ocserv catches any
+# direct file logging if the binary ever grows it (journald is the default).
+ReadWritePaths=/var/lib/era-ocserv /var/log/era-ocserv
+# Allow tun device creation. /dev/net/tun is the only device node we touch.
+DeviceAllow=/dev/net/tun rw
+
+[Install]
+WantedBy=multi-user.target
