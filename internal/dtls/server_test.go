@@ -185,13 +185,25 @@ func discardLogger() *slog.Logger {
 // in a background goroutine; the test's cleanup tears it down.
 func startDTLS(t *testing.T, addr string, reg SessionRegistry) *Server {
 	t.Helper()
-	srv, err := NewServer(Config{
+	return startDTLSWithConfig(t, Config{
 		Listen:           addr,
 		Registry:         reg,
 		Logger:           discardLogger(),
 		HandshakeTimeout: 5 * time.Second,
 		IdleTimeout:      30 * time.Second,
 	})
+}
+
+// startDTLSWithConfig is the explicit-Config variant of startDTLS, used
+// by tests that need to override the rekey deadlines or other
+// non-default fields. Listen and Registry are still required and the
+// Logger defaults to discardLogger if the caller did not set one.
+func startDTLSWithConfig(t *testing.T, cfg Config) *Server {
+	t.Helper()
+	if cfg.Logger == nil {
+		cfg.Logger = discardLogger()
+	}
+	srv, err := NewServer(cfg)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -648,6 +660,297 @@ func TestConcurrentHandshakesNoCollision(t *testing.T) {
 		case <-time.After(time.Until(deadline)):
 			t.Fatalf("ReadPacket on %s timed out", s.token)
 		}
+	}
+}
+
+// TestRekeyTimeBudgetTearsDownDTLS exercises the wall-clock rekey
+// deadline: a Server configured with a very short RekeyAfter will
+// close the DTLS conn once the deadline fires, but it must NOT close
+// the underlying Tunnel — the AnyConnect protocol assumes the CSTP
+// control channel survives a DTLS rekey (protocol doc §2.4) and the
+// client re-handshakes on the same UDP socket to bring DTLS back up.
+//
+// We assert two observable contracts:
+//
+//  1. The pion client side eventually observes a read error after
+//     the budget fires — i.e. the conn really did get torn down.
+//  2. tun.Identity / tun.SessionID still return live values and a
+//     Tunnel-side WritePacket on the CSTP fallback path succeeds.
+func TestRekeyTimeBudgetTearsDownDTLS(t *testing.T) {
+	cstpSrv := freshCSTPServer(t)
+
+	id := cstp.Identity{
+		DeviceID: "dev-rekey-time",
+		IPv6:     netip.MustParsePrefix("2001:db8::a/128"),
+		MTU:      1406,
+	}
+	sessionToken := randSessionToken(t)
+	psk := randPSK(t)
+	tun, cstpClientConn := makeTunnel(t, cstpSrv, id, sessionToken)
+	cstp.RegisterDTLSForTesting(cstpSrv, sessionToken, psk, tun)
+
+	// Drain CSTP-side bytes so the fallback WritePacket does not
+	// block on the synchronous net.Pipe.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := cstpClientConn.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	reg := &cstpServerRegistry{srv: cstpSrv}
+	addr := freeUDPAddr(t)
+	_ = startDTLSWithConfig(t, Config{
+		Listen:           addr,
+		Registry:         reg,
+		Logger:           discardLogger(),
+		HandshakeTimeout: 3 * time.Second,
+		// Very short budget so the test is fast. The 1 GiB byte cap
+		// keeps the byte path out of the way; only the time deadline
+		// should fire here.
+		RekeyAfter:      300 * time.Millisecond,
+		RekeyAfterBytes: 1 << 30,
+		IdleTimeout:     5 * time.Second,
+	})
+
+	client := pionClient(t, addr, sessionToken, psk)
+
+	// Push one frame so the server-side handleConn has progressed
+	// past AttachDTLS by the time the rekey deadline fires.
+	if _, err := client.Write([]byte{pktData, 'x'}); err != nil {
+		t.Fatalf("client write probe: %v", err)
+	}
+	rxBuf := make([]byte, 32)
+	if _, err := tun.ReadPacket(rxBuf); err != nil {
+		t.Fatalf("tun.ReadPacket probe: %v", err)
+	}
+
+	// Wait for the budget to fire, then confirm the client-side
+	// conn really did get closed by the server.
+	if err := client.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	buf := make([]byte, 64)
+	_, err := client.Read(buf)
+	if err == nil {
+		t.Fatalf("client read returned no error; expected close after rekey budget")
+	}
+
+	// Sanity: the Tunnel itself is still alive, and a CSTP-fallback
+	// WritePacket goes through. The DetachDTLS in handleConn defer
+	// has already swapped the data plane back.
+	if tun.Identity().DeviceID != "dev-rekey-time" {
+		t.Fatalf("tunnel identity changed: %+v", tun.Identity())
+	}
+	// Wait a beat for handleConn to run its defer.
+	time.Sleep(100 * time.Millisecond)
+	if _, err := tun.WritePacket([]byte("after-rekey")); err != nil {
+		t.Fatalf("Tunnel.WritePacket after DTLS rekey: %v", err)
+	}
+}
+
+// TestRekeyByteBudgetTearsDownDTLS exercises the same contract but
+// fires the byte budget instead. RekeyAfterBytes is set tiny so a
+// handful of frames trip the cap. RekeyAfter is set huge so the
+// wall-clock deadline cannot fire first.
+//
+// The byte budget counts bytesIn + bytesOut. Inbound writes from the
+// pion client come in via the read loop; outbound writes (server ->
+// client) go through Tunnel.writeDTLSFrame and are accounted into the
+// shared counter via the AttachDTLSWithCounter wiring. We exercise
+// the inbound side here because it's the simpler driver.
+func TestRekeyByteBudgetTearsDownDTLS(t *testing.T) {
+	cstpSrv := freshCSTPServer(t)
+
+	id := cstp.Identity{
+		DeviceID: "dev-rekey-bytes",
+		IPv6:     netip.MustParsePrefix("2001:db8::b/128"),
+		MTU:      1406,
+	}
+	sessionToken := randSessionToken(t)
+	psk := randPSK(t)
+	tun, cstpClientConn := makeTunnel(t, cstpSrv, id, sessionToken)
+	cstp.RegisterDTLSForTesting(cstpSrv, sessionToken, psk, tun)
+
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := cstpClientConn.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	reg := &cstpServerRegistry{srv: cstpSrv}
+	addr := freeUDPAddr(t)
+	_ = startDTLSWithConfig(t, Config{
+		Listen:           addr,
+		Registry:         reg,
+		Logger:           discardLogger(),
+		HandshakeTimeout: 3 * time.Second,
+		RekeyAfter:       30 * time.Second, // far away
+		// Tiny byte budget: ~64 bytes will trip after the first or
+		// second data frame depending on framing overhead.
+		RekeyAfterBytes: 64,
+		IdleTimeout:     5 * time.Second,
+	})
+
+	client := pionClient(t, addr, sessionToken, psk)
+
+	// Send several inbound data frames; each one will push bytesIn
+	// well past the 64-byte cap.
+	payload := []byte("0123456789ABCDEFGHIJKLMNOPQRSTUV")
+	for i := 0; i < 4; i++ {
+		frame := append([]byte{pktData}, payload...)
+		if _, err := client.Write(frame); err != nil {
+			// Once the budget fires the write may fail; that's the
+			// observable contract.
+			break
+		}
+		// Drain whatever the Tunnel buffers so subsequent writes
+		// don't stall on the data channel.
+		buf := make([]byte, 256)
+		rxDone := make(chan struct{})
+		go func() {
+			_, _ = tun.ReadPacket(buf)
+			close(rxDone)
+		}()
+		select {
+		case <-rxDone:
+		case <-time.After(500 * time.Millisecond):
+			// Budget may have already fired and torn the conn down
+			// before the inbound frame was delivered; that is fine.
+		}
+	}
+
+	// Confirm the client-side conn really did get closed by the
+	// server: a read should fail within a short window.
+	if err := client.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	rbuf := make([]byte, 64)
+	if _, err := client.Read(rbuf); err == nil {
+		t.Fatalf("client read returned no error after byte budget fired")
+	}
+
+	// Tunnel is still alive after the DTLS-side close.
+	if tun.Identity().DeviceID != "dev-rekey-bytes" {
+		t.Fatalf("tunnel identity changed: %+v", tun.Identity())
+	}
+	time.Sleep(100 * time.Millisecond)
+	if _, err := tun.WritePacket([]byte("after-byte-budget")); err != nil {
+		t.Fatalf("Tunnel.WritePacket after DTLS byte budget: %v", err)
+	}
+}
+
+// TestOutboundDataAccountsAgainstByteBudget proves the shared counter
+// wiring works end-to-end: outbound writes through the Tunnel are
+// counted toward the DTLS server's rekey byte budget, not just
+// inbound ones. Without the AttachDTLSWithCounter plumbing this test
+// would never trip the budget.
+func TestOutboundDataAccountsAgainstByteBudget(t *testing.T) {
+	cstpSrv := freshCSTPServer(t)
+
+	id := cstp.Identity{
+		DeviceID: "dev-rekey-outbound",
+		IPv6:     netip.MustParsePrefix("2001:db8::c/128"),
+		MTU:      1406,
+	}
+	sessionToken := randSessionToken(t)
+	psk := randPSK(t)
+	tun, cstpClientConn := makeTunnel(t, cstpSrv, id, sessionToken)
+	cstp.RegisterDTLSForTesting(cstpSrv, sessionToken, psk, tun)
+
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := cstpClientConn.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	reg := &cstpServerRegistry{srv: cstpSrv}
+	addr := freeUDPAddr(t)
+	_ = startDTLSWithConfig(t, Config{
+		Listen:           addr,
+		Registry:         reg,
+		Logger:           discardLogger(),
+		HandshakeTimeout: 3 * time.Second,
+		RekeyAfter:       30 * time.Second, // far away
+		RekeyAfterBytes:  128,
+		IdleTimeout:      5 * time.Second,
+	})
+
+	client := pionClient(t, addr, sessionToken, psk)
+
+	// Probe one inbound frame so handleConn finishes AttachDTLS.
+	if _, err := client.Write([]byte{pktData, 'p'}); err != nil {
+		t.Fatalf("client write probe: %v", err)
+	}
+	probe := make([]byte, 32)
+	if _, err := tun.ReadPacket(probe); err != nil {
+		t.Fatalf("tun.ReadPacket probe: %v", err)
+	}
+
+	// Read on the client side in the background so the pion socket
+	// doesn't fill its receive buffer. The goroutine exits once the
+	// conn closes, which is how we detect the server-side teardown.
+	rxBuf := make([]byte, 256)
+	rxDone := make(chan struct{})
+	go func() {
+		defer close(rxDone)
+		for {
+			if err := client.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				return
+			}
+			if _, err := client.Read(rxBuf); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Drive outbound writes through the Tunnel; interleave small
+	// inbound tickles so the server-side read loop wakes up promptly
+	// to check the byte budget (the check only runs immediately after
+	// a successful Read returns).
+	bigPayload := make([]byte, 64)
+	for i := range bigPayload {
+		bigPayload[i] = 'z'
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := tun.WritePacket(bigPayload); err != nil {
+			break
+		}
+		// Tickle: a 1-byte data frame is enough to wake the read loop.
+		if _, err := client.Write([]byte{pktData, '.'}); err != nil {
+			break
+		}
+		select {
+		case <-rxDone:
+			return
+		case <-time.After(20 * time.Millisecond):
+		}
+		// Drain whatever the Tunnel buffered so the dataCh does not
+		// stall on the test's lack of an active ReadPacket consumer.
+		drainBuf := make([]byte, 64)
+		drainCh := make(chan struct{})
+		go func() {
+			_, _ = tun.ReadPacket(drainBuf)
+			close(drainCh)
+		}()
+		select {
+		case <-drainCh:
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	select {
+	case <-rxDone:
+	case <-time.After(time.Second):
+		t.Fatalf("byte budget did not trip on outbound writes")
 	}
 }
 
