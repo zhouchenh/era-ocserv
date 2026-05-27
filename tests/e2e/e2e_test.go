@@ -48,11 +48,19 @@ func TestStage1HappyPath(t *testing.T) {
 	if got := hdr.Get("X-CSTP-MTU"); got == "" {
 		t.Errorf("X-CSTP-MTU missing")
 	}
-	if got := hdr.Get("X-DTLS-Master-Secret"); got == "" {
-		t.Errorf("X-DTLS-Master-Secret missing (PSK derivation should have worked on a real *tls.Conn)")
-	}
 	if got := hdr.Get("X-CSTP-Hostname"); got != "vpn.eracloud.app" {
 		t.Errorf("X-CSTP-Hostname = %q, want vpn.eracloud.app", got)
+	}
+	// Stage 1 default ships no DTLS server, so the gateway MUST NOT
+	// advertise X-DTLS-* headers. The Stage 2 work item (separate
+	// branch feat/internal-dtls) flips DTLSAdvertise=true and the
+	// dedicated TestStage1DTLSAdvertisedWhenEnabled test exercises
+	// the positive path.
+	if got := hdr.Get("X-DTLS-Master-Secret"); got != "" {
+		t.Errorf("X-DTLS-Master-Secret should be omitted in Stage 1 default (no DTLS server), got %q", got)
+	}
+	if got := hdr.Get("X-DTLS-CipherSuite"); got != "" {
+		t.Errorf("X-DTLS-CipherSuite should be omitted in Stage 1 default, got %q", got)
 	}
 
 	// --- client -> server (tunnel ingress -> tun queue) -------------

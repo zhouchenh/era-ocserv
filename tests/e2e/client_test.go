@@ -197,14 +197,25 @@ func (c *fakeClient) initAndAuth(host, user, pass string) (string, *httpResponse
 // Future Reads must go through readFrame, not the bufio.Reader's
 // HTTP machinery.
 func (c *fakeClient) connect(host, token string) (http.Header, error) {
+	return c.connectWithCipher(host, token, "AES128-GCM-SHA256")
+}
+
+// connectWithCipher is the underlying CONNECT helper. dtlsCipher is
+// the value the client offers for X-DTLS-CipherSuite; pass empty to
+// omit the header entirely (used by tests that exercise the "client
+// offered nothing → server omits DTLS" path).
+func (c *fakeClient) connectWithCipher(host, token, dtlsCipher string) (http.Header, error) {
 	req := "CONNECT /CSCOSSLC/tunnel HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
 		"User-Agent: AnyConnect Windows 5.1.10.233\r\n" +
 		"Cookie: webvpn=" + token + "\r\n" +
 		"X-CSTP-Version: 1\r\n" +
 		"X-CSTP-Base-MTU: 1500\r\n" +
-		"X-CSTP-MTU: 1400\r\n" +
-		"\r\n"
+		"X-CSTP-MTU: 1400\r\n"
+	if dtlsCipher != "" {
+		req += "X-DTLS-CipherSuite: " + dtlsCipher + "\r\n"
+	}
+	req += "\r\n"
 	if _, err := io.WriteString(c.conn, req); err != nil {
 		return nil, fmt.Errorf("write CONNECT: %w", err)
 	}

@@ -120,6 +120,18 @@ type Config struct {
 	// typical 1500 base MTU).
 	DefaultMTU int
 
+	// DTLSAdvertise controls whether the CONNECT handler emits the
+	// X-DTLS-* header set. Stage 1 ships no DTLS server, so the
+	// default false keeps the server TCP-only at the wire level (the
+	// explicitly supported degraded mode per protocol spec §2.2).
+	// Stage 2 flips this true once the loopback UDP DTLS listener is
+	// wired (see ADR 0057 §6). Without this gate, clients that read
+	// X-DTLS-Master-Secret / X-DTLS-Port will sit on a UDP handshake
+	// timeout before falling back to TCP — macOS Cisco Secure Client
+	// in particular disables DTLS for the rest of the session after
+	// the first timeout (protocol spec §3.2).
+	DTLSAdvertise bool
+
 	// SessionTimeout caps the lifetime of an issued session cookie. A
 	// zero value uses 1 hour, which is generous for the auth->CONNECT
 	// window but bounded enough to avoid stale-cookie reuse.

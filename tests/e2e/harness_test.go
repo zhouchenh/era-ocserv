@@ -81,6 +81,16 @@ func withKeepaliveInterval(seconds int) harnessOpt {
 	}
 }
 
+// withDTLSAdvertise enables the X-DTLS-* header emission gate. Used
+// by tests that exercise the Stage 2 DTLS-on path; Stage 1 default
+// keeps it disabled so clients do not stall on a UDP handshake
+// against a server that does not listen.
+func withDTLSAdvertise() harnessOpt {
+	return func(h *harness) {
+		h.cfg.DTLSAdvertise = true
+	}
+}
+
 // newHarness brings up a full Stage 1 gateway: TLS listener, CSTP
 // server, MockVerifier seeded with one credential, MockResolver
 // seeded with the canonical /128, fake tun, and bridge. The harness

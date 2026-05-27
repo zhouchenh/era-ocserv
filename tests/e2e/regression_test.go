@@ -153,6 +153,68 @@ func TestStage1InnerSourceSpoofDropped(t *testing.T) {
 	}
 }
 
+// TestStage1DTLSAdvertisedWhenEnabled covers P1 #1 + P1 #5: when
+// Config.DTLSAdvertise is true AND the client offered the locked
+// AES128-GCM-SHA256 cipher, the gateway emits X-DTLS-* headers with
+// the locked cipher echoed back. The reverse cases (gate disabled,
+// or client offered a different cipher) are covered by
+// TestStage1DTLSOmittedWhenGateDisabled and
+// TestStage1DTLSOmittedWhenClientOffersUnsupportedCipher below.
+func TestStage1DTLSAdvertisedWhenEnabled(t *testing.T) {
+	h := newHarness(t, withDTLSAdvertise())
+	clientCert := h.pk.issueClientLeaf(t, canonicalDeviceID)
+	client := &fakeClient{addr: h.Address(), tlsConfig: h.pk.clientTLSConfig(clientCert)}
+	if err := client.dial(); err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.close()
+
+	token, _, _, err := client.initAndAuth("vpn.eracloud.app", "alice", "hunter2")
+	if err != nil {
+		t.Fatalf("initAndAuth: %v", err)
+	}
+	hdr, err := client.connect("vpn.eracloud.app", token)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if got := hdr.Get("X-DTLS-Master-Secret"); got == "" {
+		t.Errorf("X-DTLS-Master-Secret missing when DTLSAdvertise=true")
+	}
+	if got := hdr.Get("X-DTLS-CipherSuite"); got != "AES128-GCM-SHA256" {
+		t.Errorf("X-DTLS-CipherSuite = %q, want AES128-GCM-SHA256", got)
+	}
+}
+
+// TestStage1DTLSOmittedWhenClientOffersUnsupportedCipher covers
+// P1 #5: if the client's X-DTLS-CipherSuite list does not contain
+// AES128-GCM-SHA256 (the cipher ADR 0057 §6 locks the DTLS profile
+// to), the server must omit the X-DTLS-* header set entirely, even
+// when DTLSAdvertise is on.
+func TestStage1DTLSOmittedWhenClientOffersUnsupportedCipher(t *testing.T) {
+	h := newHarness(t, withDTLSAdvertise())
+	clientCert := h.pk.issueClientLeaf(t, canonicalDeviceID)
+	client := &fakeClient{addr: h.Address(), tlsConfig: h.pk.clientTLSConfig(clientCert)}
+	if err := client.dial(); err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.close()
+
+	token, _, _, err := client.initAndAuth("vpn.eracloud.app", "alice", "hunter2")
+	if err != nil {
+		t.Fatalf("initAndAuth: %v", err)
+	}
+	hdr, err := client.connectWithCipher("vpn.eracloud.app", token, "AES256-GCM-SHA384")
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if got := hdr.Get("X-DTLS-Master-Secret"); got != "" {
+		t.Errorf("X-DTLS-Master-Secret should be omitted (client offered unsupported cipher), got %q", got)
+	}
+	if got := hdr.Get("X-DTLS-CipherSuite"); got != "" {
+		t.Errorf("X-DTLS-CipherSuite should be omitted, got %q", got)
+	}
+}
+
 // eqBytes is a tiny equality helper that avoids importing bytes for
 // one call.
 func eqBytes(a, b []byte) bool {

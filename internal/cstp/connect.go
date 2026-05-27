@@ -77,10 +77,25 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	innerMTU := negotiateInnerMTU(r, mtu)
 
-	// Try to derive a DTLS PSK from the outer TLS handshake. If the
-	// underlying conn isn't a *tls.Conn (test path, plain TCP), this
-	// silently downgrades to TCP-only CSTP.
-	dtlsSecret, dtlsOK := deriveDTLSSecret(r)
+	// Decide whether to advertise DTLS. Three preconditions must
+	// hold:
+	//   1. Config.DTLSAdvertise is true (Stage 2 onwards; Stage 1
+	//      ships no DTLS server and must stay TCP-only — see spec
+	//      §2.2 and ADR 0057 §6).
+	//   2. The client offered AES128-GCM-SHA256 in its
+	//      X-DTLS-CipherSuite list. We hardcode that cipher because
+	//      ADR 0057 §6 locks the DTLS profile to it; any other
+	//      offering is treated as no DTLS.
+	//   3. The PSK exporter on the outer TLS conn works. Without a
+	//      real *tls.Conn (e.g. unit tests over net.Pipe) we cannot
+	//      derive the PSK.
+	var (
+		dtlsSecret []byte
+		dtlsOK     bool
+	)
+	if s.cfg.DTLSAdvertise && clientOffersDTLSCipher(r, lockedDTLSCipher) {
+		dtlsSecret, dtlsOK = deriveDTLSSecret(r)
+	}
 
 	headers := w.Header()
 	emitCSTPHeaders(headers, s.cfg, id, innerMTU)
@@ -220,20 +235,37 @@ func emitCSTPHeaders(h http.Header, cfg Config, id Identity, innerMTU int) {
 	h.Set("X-CSTP-Smartcard-Removal-Disconnect", "true")
 	h.Set("X-CSTP-License", "accept")
 	h.Set("X-CSTP-DynDNS", "true")
-	h.Set("X-CSTP-Rekey-Time", "28800")
-	h.Set("X-CSTP-Rekey-Method", "ssl")
+	// X-CSTP-Rekey-Time / X-CSTP-Rekey-Method are intentionally NOT
+	// emitted in Stage 1. Advertising "ssl" rekey would tell the
+	// client to attempt a mid-session TLS renegotiation; Go's
+	// crypto/tls server rejects renegotiation by default
+	// (RenegotiateNever) and exposes no symmetric server-side knob,
+	// so the renegotiation attempt would drop the session at the 8h
+	// mark on the dot. The alternative ("new-tunnel" rekey) requires
+	// the reconnect-via-cookie flow which is not implemented yet
+	// (spec §1.8). Until that lands, clients keep the same TLS
+	// connection up until idle/disconnect. Wave-1 review P1 #3
+	// (docs/review/wave-1-stage-1.md).
 	h.Set("X-CSTP-Disconnected-Timeout", "2400")
 }
 
-// emitDTLSHeaders advertises the DTLS PSK-NEGOTIATE channel to the
-// client. The DTLS implementation itself lives in a sibling package;
-// here we only emit the headers required for the client to attempt the
-// UDP handshake. The exporter-derived 32-byte secret is hex-encoded
-// per legacy convention (Cisco Secure Client accepts both hex and
-// base64; we pick hex to match openconnect / ocserv).
+// lockedDTLSCipher is the only DTLS cipher era-ocserv accepts.
+// ADR 0057 §6 locks the DTLS profile to AES128-GCM-SHA256 as
+// defence-in-depth against CVE-2026-26014 (nonce reuse in less
+// constrained AEAD selections). Any client that does not offer this
+// cipher is downgraded to TCP-only.
+const lockedDTLSCipher = "AES128-GCM-SHA256"
+
+// emitDTLSHeaders advertises the DTLS channel to the client using
+// the cipher locked by ADR 0057 §6. The DTLS implementation itself
+// lives in a sibling package; here we only emit the headers required
+// for the client to attempt the UDP handshake. The exporter-derived
+// 32-byte secret is hex-encoded per legacy convention (Cisco Secure
+// Client accepts both hex and base64; we pick hex to match
+// openconnect / ocserv).
 func emitDTLSHeaders(h http.Header, secret []byte, innerMTU int) {
 	h.Set("X-DTLS-Master-Secret", strings.ToUpper(hex.EncodeToString(secret)))
-	h.Set("X-DTLS-CipherSuite", "PSK-NEGOTIATE")
+	h.Set("X-DTLS-CipherSuite", lockedDTLSCipher)
 	h.Set("X-DTLS-Port", "443")
 	h.Set("X-DTLS-Rekey-Time", "28800")
 	h.Set("X-DTLS-Rekey-Method", "ssl")
@@ -252,6 +284,30 @@ func emitDTLSHeaders(h http.Header, secret []byte, innerMTU int) {
 	if sid, err := randHex(nil, 32); err == nil {
 		h.Set("X-DTLS-Session-ID", sid)
 	}
+}
+
+// clientOffersDTLSCipher returns true if the CONNECT request's
+// X-DTLS-CipherSuite header lists wantCipher among its comma- or
+// space-separated entries. Per protocol spec §2.2 the server must
+// only advertise DTLS when the client has offered a cipher we
+// accept; otherwise the X-DTLS-* header set is omitted.
+func clientOffersDTLSCipher(r *http.Request, wantCipher string) bool {
+	offered := r.Header.Get("X-DTLS-CipherSuite")
+	if offered == "" {
+		return false
+	}
+	// Normalise to "split on any of comma / whitespace, lowercase".
+	// AnyConnect 5.x sends a colon-or-space list; OpenConnect uses
+	// commas. Accept either.
+	want := strings.ToLower(wantCipher)
+	for _, part := range strings.FieldsFunc(offered, func(r rune) bool {
+		return r == ',' || r == ':' || r == ' ' || r == '\t'
+	}) {
+		if strings.ToLower(strings.TrimSpace(part)) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // deriveDTLSSecret pulls a 32-byte PSK from the outer TLS session
