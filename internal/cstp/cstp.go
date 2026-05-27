@@ -15,6 +15,7 @@ package cstp
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net/netip"
 	"sync"
@@ -37,6 +38,23 @@ type Verifier interface {
 // implementation lives in internal/iam.
 type Resolver interface {
 	Resolve(ctx context.Context, deviceID string) (Identity, error)
+}
+
+// CertValidator extracts the ERA device ID from an mTLS-validated
+// client certificate. It is consumed by the CONNECT handler to
+// re-bind the cert to the session minted at phase 2 (protocol spec
+// §1.8, ADR 0057 §4): we require the cert presented on the CONNECT
+// TLS handshake to be the same one that authenticated the phase-2
+// auth-reply. Without this re-check, a leaked session token plus any
+// validly-signed ERA device cert could take over another device's
+// /128.
+//
+// The concrete production implementation is internal/auth.CertValidator;
+// tests inject their own. A nil CertValidator on cstp.Config disables
+// the re-bind check (useful for unit tests that exercise CONNECT over
+// non-TLS net.Pipe).
+type CertValidator interface {
+	Validate(state tls.ConnectionState) (deviceID string, err error)
 }
 
 // Identity is the per-device configuration handed to the CONNECT phase
@@ -62,6 +80,15 @@ type Config struct {
 	// Resolver maps the authenticated device ID to its inner IP
 	// configuration during phase 3. Required.
 	Resolver Resolver
+
+	// CertValidator re-extracts the device ID from the mTLS client
+	// certificate on the phase-3 CONNECT request. If non-nil, the
+	// CONNECT handler rejects the request with 401 when the cert
+	// deviceID does not equal the deviceID bound at phase 2 promote
+	// time. Leave nil only in tests that drive CONNECT over a non-TLS
+	// transport (net.Pipe); production wiring always supplies a
+	// validator.
+	CertValidator CertValidator
 
 	// ServerName is the canonical hostname emitted as X-CSTP-Hostname
 	// on the CONNECT response. Cisco Secure Client refuses a connection

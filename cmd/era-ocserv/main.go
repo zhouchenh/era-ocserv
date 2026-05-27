@@ -125,6 +125,7 @@ func run() error {
 	srv := cstp.NewServer(cstp.Config{
 		Verifier:          certBoundVerifier{inner: hv},
 		Resolver:          resolverAdapter{inner: tpmResolver},
+		CertValidator:     cv,
 		ServerName:        cfg.serverName,
 		DNS:               dns,
 		DefaultDomain:     cfg.defaultDomain,

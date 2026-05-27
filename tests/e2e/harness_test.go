@@ -131,6 +131,10 @@ func newHarness(t *testing.T, opts ...harnessOpt) *harness {
 	// verifier and the cert validator can disagree about deviceID.
 	h.cfg.Verifier = certBoundAdapter{inner: verifier}
 	h.cfg.Resolver = resolverAdapter{inner: resolver}
+	// Wire the cert validator so the phase-3 CONNECT handler re-binds
+	// the inbound cert to the deviceID stored at promote time (spec
+	// §1.8 / ADR 0057 §4). Mirrors production main.go.
+	h.cfg.CertValidator = certVal
 
 	h.cstpSrv = cstp.NewServer(h.cfg)
 

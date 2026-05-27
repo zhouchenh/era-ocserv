@@ -17,17 +17,23 @@ import (
 //
 //  1. Pull the session cookie out of the request and look it up. A
 //     missing or unknown cookie returns 401, ending the connection.
-//  2. Resolve the identity (per-device /128, MTU) via the injected
+//  2. Re-bind the mTLS cert to the session (spec §1.8 / ADR 0057 §4):
+//     extract the deviceID from the current CONNECT request's client
+//     cert via cfg.CertValidator and reject with 401 if it does not
+//     match the deviceID stored at phase-2 promote time. Skipping this
+//     step would let a leaked session token + any valid ERA device
+//     cert take over another device's /128.
+//  3. Resolve the identity (per-device /128, MTU) via the injected
 //     Resolver. A resolver error returns 502 so the client surfaces a
 //     distinct failure mode and does not loop on a bad cookie.
-//  3. Compute the inner MTU from the X-CSTP-Base-MTU / X-CSTP-MTU
+//  4. Compute the inner MTU from the X-CSTP-Base-MTU / X-CSTP-MTU
 //     headers per spec §1.7.
-//  4. Derive the DTLS PSK from the outer TLS via the RFC 5705 keying
+//  5. Derive the DTLS PSK from the outer TLS via the RFC 5705 keying
 //     material exporter and advertise it via X-DTLS-Master-Secret etc.
 //     A failure of the exporter (caller did not pass a *tls.Conn capable
 //     of exporting, e.g. the raw test path) downgrades to TCP-only and
 //     omits the X-DTLS-* headers.
-//  5. Emit the full X-CSTP-* / X-DTLS-* header set, hijack the conn, and
+//  6. Emit the full X-CSTP-* / X-DTLS-* header set, hijack the conn, and
 //     publish the Tunnel on s.tunnels.
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	cookie := extractWebVPNCookie(r)
@@ -36,6 +42,27 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Connection", "close")
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
+	}
+
+	// Re-bind the cert to the session. The validator is optional only
+	// to keep unit tests that drive CONNECT over net.Pipe usable;
+	// production callers always supply one (see ADR 0057 §4).
+	if s.cfg.CertValidator != nil {
+		if r.TLS == nil {
+			w.Header().Set("Connection", "close")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		certID, err := s.cfg.CertValidator.Validate(*r.TLS)
+		if err != nil || certID == "" || certID != sess.deviceID {
+			// Drop the now-tainted session so the same token cannot be
+			// retried with another cert. This collapses the attacker's
+			// window to a single CONNECT attempt per stolen token.
+			s.sessions.consume(sess)
+			w.Header().Set("Connection", "close")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
 	}
 
 	id, err := s.cfg.Resolver.Resolve(r.Context(), sess.deviceID)
