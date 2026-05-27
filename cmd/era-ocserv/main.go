@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/zhouchenh/era-ocserv/internal/auth"
+	"github.com/zhouchenh/era-ocserv/internal/bridge"
 	"github.com/zhouchenh/era-ocserv/internal/cstp"
 	"github.com/zhouchenh/era-ocserv/internal/iam"
 	"github.com/zhouchenh/era-ocserv/internal/tun"
@@ -148,8 +149,8 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	br := newBridge(tunDeviceAdapter{dev: dev}, srv)
-	go br.run(ctx)
+	br := bridge.New(tunDeviceAdapter{dev: dev}, srv)
+	go br.Run(ctx)
 
 	go func() {
 		<-ctx.Done()
@@ -339,17 +340,17 @@ func (r resolverAdapter) Resolve(ctx context.Context, deviceID string) (cstp.Ide
 	}, nil
 }
 
-// tunDeviceAdapter satisfies bridge.tunDevice for the production
-// *tun.Device. It exists so the bridge depends on a narrow interface
-// (Read/Write per queue) rather than the Linux-only concrete type,
-// which lets cross-platform tests substitute a fake.
+// tunDeviceAdapter satisfies bridge.Device for the production
+// *tun.Device. It exists so the bridge package depends on a narrow
+// interface (Read/Write per queue) rather than the Linux-only
+// concrete type, which lets cross-platform tests substitute a fake.
 type tunDeviceAdapter struct {
 	dev *tun.Device
 }
 
-func (a tunDeviceAdapter) Queues() []tunQueueIO {
+func (a tunDeviceAdapter) Queues() []bridge.QueueIO {
 	src := a.dev.Queues()
-	out := make([]tunQueueIO, len(src))
+	out := make([]bridge.QueueIO, len(src))
 	for i, q := range src {
 		out[i] = q
 	}

@@ -1,4 +1,13 @@
-package main
+// Package bridge wires the CSTP control-plane Server to a Linux tun
+// device. It pumps inner IPv6 packets in both directions: tunnel ->
+// tun (egress from the client) and tun -> tunnel (ingress destined
+// for the client's per-device /128).
+//
+// The bridge depends on two narrow interfaces (QueueIO, Device) rather
+// than the concrete Linux-only *tun.Device. This lets cross-platform
+// tests substitute an in-memory fake while production code in
+// cmd/era-ocserv passes a thin adapter around the real device.
+package bridge
 
 import (
 	"context"
@@ -13,23 +22,25 @@ import (
 	"github.com/zhouchenh/era-ocserv/internal/cstp"
 )
 
-// tunQueueIO is the subset of *tun.Queue the bridge actually uses. It
-// is named locally so cross-platform tests can substitute a fake without
-// pulling in the Linux-only tun package.
-type tunQueueIO interface {
+// QueueIO is the per-queue subset of *tun.Queue the bridge needs.
+// One IP packet per Read; one IP packet per Write (the tun device is
+// message-oriented, not a byte stream).
+type QueueIO interface {
 	Read(p []byte) (int, error)
 	Write(p []byte) (int, error)
 }
 
-// tunDevice is the subset of *tun.Device the bridge needs. Only Queues
-// is consumed at runtime; Close stays on the caller (main.go owns the
-// device lifecycle).
-type tunDevice interface {
-	Queues() []tunQueueIO
+// Device is the subset of *tun.Device the bridge needs. Only Queues
+// is consumed at runtime; the caller (cmd/era-ocserv) owns Open and
+// Close.
+type Device interface {
+	Queues() []QueueIO
 }
 
-type bridge struct {
-	dev       tunDevice
+// Bridge couples a *cstp.Server to a tun Device. Constructed with New
+// and started with Run.
+type Bridge struct {
+	dev       Device
 	srv       *cstp.Server
 	clients   sync.Map
 	rrCounter atomic.Uint64
@@ -40,11 +51,17 @@ type activeClient struct {
 	inner  netip.Addr
 }
 
-func newBridge(dev tunDevice, srv *cstp.Server) *bridge {
-	return &bridge{dev: dev, srv: srv}
+// New builds a Bridge for the given tun device and CSTP server. The
+// returned value is not started; call Run on a goroutine.
+func New(dev Device, srv *cstp.Server) *Bridge {
+	return &Bridge{dev: dev, srv: srv}
 }
 
-func (b *bridge) run(ctx context.Context) {
+// Run drives the bridge until ctx is canceled or the CSTP server is
+// closed. It launches one goroutine per tun queue plus one goroutine
+// per accepted tunnel. Returns when Accept returns ErrServerClosed
+// or context.Canceled.
+func (b *Bridge) Run(ctx context.Context) {
 	for _, q := range b.dev.Queues() {
 		go b.pumpTunQueue(ctx, q)
 	}
@@ -60,7 +77,11 @@ func (b *bridge) run(ctx context.Context) {
 	}
 }
 
-func (b *bridge) pumpTunQueue(ctx context.Context, q tunQueueIO) {
+// pumpTunQueue reads IP packets from one tun queue and forwards each
+// one to the matching connected client tunnel based on the IPv6
+// destination address. Non-IPv6, too-short, or unmatched packets are
+// silently dropped.
+func (b *Bridge) pumpTunQueue(ctx context.Context, q QueueIO) {
 	buf := make([]byte, 65535)
 	for {
 		n, err := q.Read(buf)
@@ -91,7 +112,9 @@ func (b *bridge) pumpTunQueue(ctx context.Context, q tunQueueIO) {
 	}
 }
 
-func (b *bridge) pumpTunnel(ctx context.Context, t *cstp.Tunnel) {
+// pumpTunnel reads inner IP packets from one client tunnel and
+// round-robins them across the available tun queues for egress.
+func (b *Bridge) pumpTunnel(ctx context.Context, t *cstp.Tunnel) {
 	id := t.Identity()
 	inner := id.IPv6.Addr()
 	ac := &activeClient{tunnel: t, inner: inner}
