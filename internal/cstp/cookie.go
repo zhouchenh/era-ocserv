@@ -9,6 +9,24 @@ import (
 	"time"
 )
 
+// Pre-auth and post-auth-pre-CONNECT lifetimes are short enough that
+// any session in those states past the threshold is by definition
+// orphaned: a real client moves from init → auth-reply in a handful
+// of seconds and from auth-complete → CONNECT in well under a second.
+// We set the thresholds generously to accommodate slow networks and
+// human-driven auth flows; orphan abuse still gets bounded.
+const (
+	// preAuthMaxAge caps the time a session can sit in the pre-auth
+	// (opaque-only) state before the janitor reaps it. The user has
+	// been served an auth-request HTML form but never POSTed back.
+	preAuthMaxAge = 5 * time.Minute
+
+	// postAuthPreConnectMaxAge caps the time between auth-complete
+	// and the CONNECT request. Real clients open the TCP+TLS conn
+	// and send CONNECT within hundreds of milliseconds.
+	postAuthPreConnectMaxAge = 60 * time.Second
+)
+
 // session is one row in the in-memory session table. The token is the
 // long-lived 32-byte URL-safe random the client echoes on the CONNECT
 // request as the "webvpn" cookie. The opaqueID is the short scratch
@@ -152,6 +170,67 @@ func (t *sessionTable) consume(s *session) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.deleteLocked(s)
+}
+
+// reapOrphans walks both indexes and drops any session that is past
+// its lifetime threshold. Returns the number of rows deleted (for
+// tests / metrics).
+//
+// Three classes of row get reaped:
+//
+//  1. Pre-auth (opaque-only, no token): age > preAuthMaxAge. The
+//     init POST minted the row but the auth-reply never followed.
+//     Without reaping these, an unauthenticated attacker can mint
+//     unlimited orphan rows by spamming POST / (wave-1 review P1
+//     #4: 100 init/s × 1h TTL = 360k stale rows / hour).
+//  2. Post-auth, pre-CONNECT (token set): age > postAuthPreConnectMaxAge.
+//     The auth-complete shipped a token but the CONNECT never
+//     arrived. Real clients move on within hundreds of ms.
+//  3. Any row past its hard expiresAt (set by the TTL). Inline
+//     reaping in lookupOpaque/lookupToken covers most of these but
+//     a row never looked up again is never reaped without this
+//     sweep.
+func (t *sessionTable) reapOrphans() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := t.now()
+	var dropped []*session
+	// Collect victims under the lock; we cannot delete while
+	// iterating a map. The byToken index is a subset of byOpaque
+	// (every authenticated row also has an opaqueID), so iterating
+	// byOpaque covers both classes.
+	for _, s := range t.byOpaque {
+		age := now.Sub(s.createdAt)
+		switch {
+		case now.After(s.expiresAt):
+			dropped = append(dropped, s)
+		case s.token == "" && age > preAuthMaxAge:
+			dropped = append(dropped, s)
+		case s.token != "" && age > postAuthPreConnectMaxAge:
+			dropped = append(dropped, s)
+		}
+	}
+	// Also catch any orphaned token-only rows in byToken that, for
+	// any future schema change, may not be reachable via byOpaque.
+	for _, s := range t.byToken {
+		if _, stillInOpaque := t.byOpaque[s.opaqueID]; !stillInOpaque {
+			// Token-only orphan (defensive — current schema does not
+			// produce these).
+			dropped = append(dropped, s)
+		}
+	}
+	for _, s := range dropped {
+		t.deleteLocked(s)
+	}
+	return len(dropped)
+}
+
+// size returns the number of pre-auth rows currently in the table.
+// Used by tests; not exported.
+func (t *sessionTable) size() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.byOpaque)
 }
 
 func (t *sessionTable) deleteLocked(s *session) {

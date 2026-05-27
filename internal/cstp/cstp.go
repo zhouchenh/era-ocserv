@@ -177,14 +177,42 @@ type Server struct {
 // fields (Verifier, Resolver, ServerName) are not checked here so that
 // tests can supply partial configs; callers that ship real traffic
 // should validate the config themselves.
+//
+// NewServer starts a janitor goroutine that periodically reaps
+// orphaned session rows (P1 #4 from the wave-1 review). The
+// goroutine stops on Close. Test configurations that need to advance
+// a fake clock past the orphan threshold drive the reaper directly
+// via the testing surface in cookie_internal_test.go.
 func NewServer(cfg Config) *Server {
 	cfg = cfg.withDefaults()
-	return &Server{
+	s := &Server{
 		cfg:      cfg,
 		sessions: newSessionTable(cfg.SessionTimeout, cfg.Now),
 		tunnels:  make(chan *Tunnel, 32),
 		closeCh:  make(chan struct{}),
 		active:   make(map[*Tunnel]struct{}),
+	}
+	go s.runSessionJanitor()
+	return s
+}
+
+// janitorInterval is how often the session-orphan reaper sweeps the
+// session table. Short enough that a 5-minute orphan threshold is
+// applied promptly, long enough that the lock is not a hot path.
+const janitorInterval = time.Minute
+
+// runSessionJanitor periodically reaps orphaned sessions. Exits on
+// closeCh. Safe to call exactly once from NewServer.
+func (s *Server) runSessionJanitor() {
+	ticker := time.NewTicker(janitorInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case <-ticker.C:
+			_ = s.sessions.reapOrphans()
+		}
 	}
 }
 
