@@ -11,11 +11,25 @@ import (
 	"sync/atomic"
 
 	"github.com/zhouchenh/era-ocserv/internal/cstp"
-	"github.com/zhouchenh/era-ocserv/internal/tun"
 )
 
+// tunQueueIO is the subset of *tun.Queue the bridge actually uses. It
+// is named locally so cross-platform tests can substitute a fake without
+// pulling in the Linux-only tun package.
+type tunQueueIO interface {
+	Read(p []byte) (int, error)
+	Write(p []byte) (int, error)
+}
+
+// tunDevice is the subset of *tun.Device the bridge needs. Only Queues
+// is consumed at runtime; Close stays on the caller (main.go owns the
+// device lifecycle).
+type tunDevice interface {
+	Queues() []tunQueueIO
+}
+
 type bridge struct {
-	dev       *tun.Device
+	dev       tunDevice
 	srv       *cstp.Server
 	clients   sync.Map
 	rrCounter atomic.Uint64
@@ -26,7 +40,7 @@ type activeClient struct {
 	inner  netip.Addr
 }
 
-func newBridge(dev *tun.Device, srv *cstp.Server) *bridge {
+func newBridge(dev tunDevice, srv *cstp.Server) *bridge {
 	return &bridge{dev: dev, srv: srv}
 }
 
@@ -46,7 +60,7 @@ func (b *bridge) run(ctx context.Context) {
 	}
 }
 
-func (b *bridge) pumpTunQueue(ctx context.Context, q *tun.Queue) {
+func (b *bridge) pumpTunQueue(ctx context.Context, q tunQueueIO) {
 	buf := make([]byte, 65535)
 	for {
 		n, err := q.Read(buf)

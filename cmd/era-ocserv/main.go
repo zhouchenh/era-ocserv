@@ -148,7 +148,7 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	br := newBridge(dev, srv)
+	br := newBridge(tunDeviceAdapter{dev: dev}, srv)
 	go br.run(ctx)
 
 	go func() {
@@ -337,4 +337,21 @@ func (r resolverAdapter) Resolve(ctx context.Context, deviceID string) (cstp.Ide
 		IPv6:     id.IPv6,
 		MTU:      id.MTU,
 	}, nil
+}
+
+// tunDeviceAdapter satisfies bridge.tunDevice for the production
+// *tun.Device. It exists so the bridge depends on a narrow interface
+// (Read/Write per queue) rather than the Linux-only concrete type,
+// which lets cross-platform tests substitute a fake.
+type tunDeviceAdapter struct {
+	dev *tun.Device
+}
+
+func (a tunDeviceAdapter) Queues() []tunQueueIO {
+	src := a.dev.Queues()
+	out := make([]tunQueueIO, len(src))
+	for i, q := range src {
+		out[i] = q
+	}
+	return out
 }
