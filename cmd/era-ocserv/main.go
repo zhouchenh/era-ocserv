@@ -14,41 +14,52 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/zhouchenh/era-ocserv/internal/auth"
+	"github.com/zhouchenh/era-ocserv/internal/certctx"
 	"github.com/zhouchenh/era-ocserv/internal/cstp"
 	"github.com/zhouchenh/era-ocserv/internal/iam"
 	"github.com/zhouchenh/era-ocserv/internal/tun"
+	"github.com/zhouchenh/era-ocserv/internal/udshandoff"
+	"github.com/zhouchenh/era-ocserv/internal/udsserve"
 )
 
 type config struct {
-	listenAddr     string
-	tlsCertPath    string
-	tlsKeyPath     string
-	clientCAPath   string
-	portalURL      string
-	portalToken    string
-	tpmURL         string
-	tpmToken       string
-	tunName        string
-	tunMTU         int
-	tunQueues      int
-	tunIPv6        string
-	serverName     string
-	dnsServers     string
-	defaultDomain  string
-	logLevel       string
+	mode          string
+	udsSocketPath string
+	listenAddr    string
+	tlsCertPath   string
+	tlsKeyPath    string
+	clientCAPath  string
+	portalURL     string
+	portalToken   string
+	tpmURL        string
+	tpmToken      string
+	tunName       string
+	tunMTU        int
+	tunQueues     int
+	tunIPv6       string
+	serverName    string
+	dnsServers    string
+	defaultDomain string
+	logLevel      string
 }
 
 func parseFlags() config {
 	var c config
-	flag.StringVar(&c.listenAddr, "listen", "127.0.0.1:8444", "loopback TCP listen address for CSTP")
-	flag.StringVar(&c.tlsCertPath, "tls-cert", "", "path to TLS cert PEM (required)")
-	flag.StringVar(&c.tlsKeyPath, "tls-key", "", "path to TLS key PEM (required)")
-	flag.StringVar(&c.clientCAPath, "client-ca", "", "path to ERA PKI client CA PEM (required for mTLS)")
+	flag.StringVar(&c.mode, "mode", "auto",
+		"listener mode: auto|uds|legacy. auto = UDS if -uds-socket parent dir exists, else legacy. "+
+			"UDS mode consumes facade plaintext handoffs per ADR-F7 Stage 2; legacy = own TLS at -listen (pre-cutover compat).")
+	flag.StringVar(&c.udsSocketPath, "uds-socket", udsserve.DefaultSocketPath,
+		"UDS socket path the facade connects to. Used by -mode=uds and by -mode=auto when the parent dir exists.")
+	flag.StringVar(&c.listenAddr, "listen", "127.0.0.1:8444", "(legacy mode) loopback TCP listen address for CSTP")
+	flag.StringVar(&c.tlsCertPath, "tls-cert", "", "(legacy mode) path to TLS cert PEM")
+	flag.StringVar(&c.tlsKeyPath, "tls-key", "", "(legacy mode) path to TLS key PEM")
+	flag.StringVar(&c.clientCAPath, "client-ca", "", "(legacy mode) path to ERA PKI client CA PEM for mTLS")
 	flag.StringVar(&c.portalURL, "era-portal-url", "", "era-portal base URL for password verification (required)")
 	flag.StringVar(&c.portalToken, "era-portal-token", "", "era-portal service token (required)")
 	flag.StringVar(&c.tpmURL, "tpm-url", "", "TPM provisioning base URL (required)")
@@ -72,18 +83,74 @@ func main() {
 	}
 }
 
+// listenerMode is the resolved-after-auto choice between UDS plaintext
+// (ADR-F7 Stage 2) and legacy loopback TCP+TLS (pre-cutover compat).
+type listenerMode int
+
+const (
+	modeLegacy listenerMode = iota
+	modeUDS
+)
+
+func (m listenerMode) String() string {
+	switch m {
+	case modeUDS:
+		return "uds"
+	case modeLegacy:
+		return "legacy"
+	default:
+		return "unknown"
+	}
+}
+
+func resolveMode(cfg config) (listenerMode, error) {
+	switch strings.ToLower(strings.TrimSpace(cfg.mode)) {
+	case "uds":
+		return modeUDS, nil
+	case "legacy":
+		return modeLegacy, nil
+	case "", "auto":
+		// Auto-detect: UDS if the socket parent directory exists,
+		// legacy otherwise. The facade's systemd unit creates the
+		// directory at boot; on hosts where the facade is not deployed
+		// the dir is absent and we fall back to legacy. This is the
+		// graceful-cutover knob the Wave II spec asks for.
+		dir := filepath.Dir(cfg.udsSocketPath)
+		if st, err := os.Stat(dir); err == nil && st.IsDir() {
+			return modeUDS, nil
+		}
+		return modeLegacy, nil
+	default:
+		return modeLegacy, fmt.Errorf("unknown -mode %q (want auto|uds|legacy)", cfg.mode)
+	}
+}
+
 func run() error {
 	cfg := parseFlags()
 	if err := setupLogger(cfg.logLevel); err != nil {
 		return err
 	}
-	if err := requireFlags(cfg); err != nil {
+	mode, err := resolveMode(cfg)
+	if err != nil {
+		return err
+	}
+	if err := requireFlags(cfg, mode); err != nil {
 		return err
 	}
 
-	tlsCfg, err := loadTLS(cfg)
-	if err != nil {
-		return fmt.Errorf("load TLS: %w", err)
+	var (
+		tlsCfg *tls.Config
+		cv     *auth.CertValidator
+	)
+	if mode == modeLegacy {
+		tlsCfg, err = loadTLS(cfg)
+		if err != nil {
+			return fmt.Errorf("load TLS: %w", err)
+		}
+		cv = auth.NewCertValidator(auth.CertValidatorConfig{
+			ClientCAs:    tlsCfg.ClientCAs,
+			SubjectField: "CN",
+		})
 	}
 
 	dev, err := openTun(cfg)
@@ -92,11 +159,6 @@ func run() error {
 	}
 	defer dev.Close()
 	slog.Info("tun opened", "name", dev.Name(), "queues", len(dev.Queues()), "mtu", cfg.tunMTU)
-
-	cv := auth.NewCertValidator(auth.CertValidatorConfig{
-		ClientCAs:    tlsCfg.ClientCAs,
-		SubjectField: "CN",
-	})
 
 	portalBase, err := url.Parse(cfg.portalURL)
 	if err != nil {
@@ -134,6 +196,63 @@ func run() error {
 		SessionTimeout:    24 * time.Hour,
 	})
 
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	br := newBridge(dev, srv)
+	go br.run(ctx)
+
+	switch mode {
+	case modeUDS:
+		return runUDS(ctx, cfg, srv)
+	case modeLegacy:
+		return runLegacy(ctx, cfg, tlsCfg, cv, srv)
+	default:
+		return fmt.Errorf("unreachable: mode=%v", mode)
+	}
+}
+
+// runUDS is the ADR-F7 Stage 2 path: era-facade hands us plaintext UDS
+// streams pre-TLS-decrypted, with the validated client-cert Subject DN
+// in TLV form. No own TLS, no own loopback TCP listener.
+func runUDS(ctx context.Context, cfg config, srv *cstp.Server) error {
+	metrics := udshandoff.NewMetrics()
+	udsLogger := slog.Default().With(slog.String("component", "udsserve"))
+	uds, err := udsserve.Listen(ctx, udsserve.Options{
+		SocketPath: cfg.udsSocketPath,
+		Logger:     udsLogger,
+		Metrics:    metrics,
+		Handler:    srv,
+	})
+	if err != nil {
+		return fmt.Errorf("udsserve listen: %w", err)
+	}
+	slog.Info("era-ocserv listening (uds mode)",
+		"socket", uds.SocketPath(),
+		"server_name", cfg.serverName,
+	)
+	go func() {
+		<-ctx.Done()
+		slog.Info("shutdown signal received")
+		// Order matters: cstp.Server.Close terminates any in-flight
+		// hijacked tunnels (their conns close, the per-stream
+		// goroutines in udshandoff unblock). Only then does
+		// udsserve.Close return promptly — otherwise its underlying
+		// udshandoff wg.Wait would block on the hijacked goroutines.
+		srv.Close()
+		if err := uds.Close(); err != nil {
+			slog.Warn("udsserve close failed", "err", err)
+		}
+	}()
+	<-ctx.Done()
+	slog.Info("era-ocserv stopped (uds mode)")
+	return nil
+}
+
+// runLegacy is the pre-cutover loopback TCP+TLS path. Kept operational
+// so a deploy can fall back without rebuilding. Defaults flip to UDS
+// when the facade's socket directory is present.
+func runLegacy(ctx context.Context, cfg config, tlsCfg *tls.Config, cv *auth.CertValidator, srv *cstp.Server) error {
 	ln, err := net.Listen("tcp", cfg.listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", cfg.listenAddr, err)
@@ -145,12 +264,6 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
-
-	br := newBridge(dev, srv)
-	go br.run(ctx)
-
 	go func() {
 		<-ctx.Done()
 		slog.Info("shutdown signal received")
@@ -160,11 +273,14 @@ func run() error {
 		srv.Close()
 	}()
 
-	slog.Info("era-ocserv listening", "addr", cfg.listenAddr, "server_name", cfg.serverName)
+	slog.Info("era-ocserv listening (legacy mode)",
+		"addr", cfg.listenAddr,
+		"server_name", cfg.serverName,
+	)
 	if err := httpSrv.Serve(tlsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("http serve: %w", err)
 	}
-	slog.Info("era-ocserv stopped")
+	slog.Info("era-ocserv stopped (legacy mode)")
 	return nil
 }
 
@@ -186,16 +302,21 @@ func setupLogger(level string) error {
 	return nil
 }
 
-func requireFlags(cfg config) error {
+// requireFlags validates that the flags this mode actually consumes are
+// non-empty. UDS-mode skips the TLS+clientCA triple because era-facade
+// does that work upstream.
+func requireFlags(cfg config, mode listenerMode) error {
 	missing := []string{}
-	if cfg.tlsCertPath == "" {
-		missing = append(missing, "-tls-cert")
-	}
-	if cfg.tlsKeyPath == "" {
-		missing = append(missing, "-tls-key")
-	}
-	if cfg.clientCAPath == "" {
-		missing = append(missing, "-client-ca")
+	if mode == modeLegacy {
+		if cfg.tlsCertPath == "" {
+			missing = append(missing, "-tls-cert")
+		}
+		if cfg.tlsKeyPath == "" {
+			missing = append(missing, "-tls-key")
+		}
+		if cfg.clientCAPath == "" {
+			missing = append(missing, "-client-ca")
+		}
 	}
 	if cfg.portalURL == "" {
 		missing = append(missing, "-era-portal-url")
@@ -209,8 +330,11 @@ func requireFlags(cfg config) error {
 	if cfg.tpmToken == "" {
 		missing = append(missing, "-tpm-token")
 	}
+	if mode == modeUDS && cfg.udsSocketPath == "" {
+		missing = append(missing, "-uds-socket")
+	}
 	if len(missing) > 0 {
-		return fmt.Errorf("required flags missing: %s", strings.Join(missing, ", "))
+		return fmt.Errorf("required flags missing (mode=%s): %s", mode, strings.Join(missing, ", "))
 	}
 	return nil
 }
@@ -273,10 +397,13 @@ func parseDNS(s string) ([]netip.Addr, error) {
 	return out, nil
 }
 
-type ctxKey int
-
-const certDeviceIDKey ctxKey = iota
-
+// certMiddleware is the legacy-mode (loopback TCP+TLS) cert handler. It
+// extracts the device id from the live TLS state, then stores it on the
+// request context via certctx for the certBoundVerifier downstream.
+//
+// UDS-mode does the equivalent extraction earlier, from
+// `ERA_TLV_MTLS_SUBJECT_DN`, and uses the same certctx key — see
+// internal/udsserve.
 func certMiddleware(cv *auth.CertValidator, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.TLS == nil {
@@ -289,18 +416,9 @@ func certMiddleware(cv *auth.CertValidator, next http.Handler) http.Handler {
 			http.Error(w, "client cert required", http.StatusUnauthorized)
 			return
 		}
-		ctx := contextWithCertDeviceID(r.Context(), deviceID)
+		ctx := certctx.WithDeviceID(r.Context(), deviceID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
-}
-
-func contextWithCertDeviceID(ctx context.Context, deviceID string) context.Context {
-	return context.WithValue(ctx, certDeviceIDKey, deviceID)
-}
-
-func certDeviceIDFromContext(ctx context.Context) (string, bool) {
-	v, ok := ctx.Value(certDeviceIDKey).(string)
-	return v, ok && v != ""
 }
 
 type certBoundVerifier struct {
@@ -308,7 +426,7 @@ type certBoundVerifier struct {
 }
 
 func (v certBoundVerifier) Verify(ctx context.Context, username, password string) (string, error) {
-	certID, ok := certDeviceIDFromContext(ctx)
+	certID, ok := certctx.FromContext(ctx)
 	if !ok {
 		return "", errors.New("internal: no cert deviceID in context")
 	}
