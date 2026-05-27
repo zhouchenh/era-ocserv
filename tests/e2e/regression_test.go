@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zhouchenh/era-ocserv/internal/iam"
 )
@@ -78,4 +79,90 @@ func TestStage1Phase3CertReBindRejectsMismatch(t *testing.T) {
 	if _, err := clientA2.connect("vpn.eracloud.app", token); err == nil {
 		t.Fatalf("token was reused after rebind failure; expected 401")
 	}
+}
+
+// TestStage1InnerSourceSpoofDropped covers P0 #2: when a connected
+// client sends an inner IPv6 packet whose src is outside its /128,
+// the bridge must drop it before writing to the tun device. Without
+// this filter, an authenticated client can source-spoof any inner
+// address — escaping the per-device identity model (ADR 0035/0036 →
+// 0057 §5) and trivially spoofing other devices' /128s.
+//
+// We send one spoofed packet followed by one legitimate packet on the
+// same tunnel and observe the tun queue: only the legit one must
+// arrive. The "send two packets, observe order" pattern catches the
+// case where spoof-checking happens but only by chance (e.g. the tun
+// is closed mid-test); the legit packet flowing confirms the bridge
+// is otherwise healthy.
+func TestStage1InnerSourceSpoofDropped(t *testing.T) {
+	h := newHarness(t)
+
+	clientCert := h.pk.issueClientLeaf(t, canonicalDeviceID)
+	client := &fakeClient{addr: h.Address(), tlsConfig: h.pk.clientTLSConfig(clientCert)}
+	if err := client.dial(); err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.close()
+
+	token, _, _, err := client.initAndAuth("vpn.eracloud.app", "alice", "hunter2")
+	if err != nil {
+		t.Fatalf("initAndAuth: %v", err)
+	}
+	if _, err := client.connect("vpn.eracloud.app", token); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	q := h.tun.QueuesTyped()[0]
+
+	clientAssigned := netip.MustParseAddr("2001:470:f9d1:9001:2a::ff")
+	spoofedSrc := netip.MustParseAddr("2001:470:f9d1:9001:dead:beef::1") // somebody else's /128
+	upstream := netip.MustParseAddr("2606:4700:4700::1111")
+	spoofed := makeIPv6Packet(spoofedSrc, upstream, []byte("spoofed-payload"))
+	if err := client.writeFrame(cstpPktData, spoofed); err != nil {
+		t.Fatalf("client writeFrame spoofed: %v", err)
+	}
+	legit := makeIPv6Packet(clientAssigned, upstream, []byte("legit-payload"))
+	if err := client.writeFrame(cstpPktData, legit); err != nil {
+		t.Fatalf("client writeFrame legit: %v", err)
+	}
+
+	select {
+	case got := <-q.out:
+		// Whatever we got first MUST be the legit packet. If we ever
+		// see the spoofed one, the bridge let it through.
+		if eqBytes(got, spoofed) {
+			t.Fatalf("bridge forwarded spoofed packet to tun (src=%s, client=%s)",
+				spoofedSrc, clientAssigned)
+		}
+		if !eqBytes(got, legit) {
+			t.Fatalf("tun received unknown payload (len=%d), expected legit packet", len(got))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for legit packet to be forwarded (anti-spoof may have dropped it too)")
+	}
+
+	// Drain a short window to confirm the spoofed packet never
+	// arrives out of order.
+	select {
+	case got := <-q.out:
+		if eqBytes(got, spoofed) {
+			t.Fatalf("bridge forwarded spoofed packet (delayed)")
+		}
+	case <-time.After(200 * time.Millisecond):
+		// Nothing else arrived — expected.
+	}
+}
+
+// eqBytes is a tiny equality helper that avoids importing bytes for
+// one call.
+func eqBytes(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
