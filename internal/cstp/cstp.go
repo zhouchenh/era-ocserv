@@ -118,10 +118,32 @@ type Server struct {
 
 	sessions *sessionTable
 
+	// dtlsTunnels is the live registry of tunnels keyed by their
+	// session token (the same token the client carries in the
+	// `webvpn` cookie on the CONNECT request). The DTLS server uses
+	// this through LookupSession to map an incoming DTLS handshake's
+	// PSK identity to the PSK derived from the outer TLS exporter
+	// and the Tunnel that should adopt the new data channel.
+	// Entries are added by handleConnect on successful CONNECT and
+	// removed by the Tunnel close path via forgetTunnel.
+	dtlsTunnels sync.Map // map[string]*dtlsRegistration
+
 	tunnels chan *Tunnel
 	closeCh chan struct{}
 	closeMu sync.Mutex
 	closed  bool
+}
+
+// dtlsRegistration is the per-session bundle the DTLS server fetches
+// via LookupSession to authenticate and route an incoming DTLS
+// handshake. The psk slice holds the 32-byte RFC 5705 keying material
+// derived from the outer TLS connection at CONNECT time using the
+// `EXPORTER-openconnect-psk` label; it is the same byte sequence the
+// client received hex-encoded in the X-DTLS-Master-Secret response
+// header and that both ends now agree on as the DTLS PSK.
+type dtlsRegistration struct {
+	psk    []byte
+	tunnel *Tunnel
 }
 
 // NewServer builds a Server with the supplied configuration. Required
@@ -200,4 +222,73 @@ func (s *Server) now() time.Time {
 		return s.cfg.Now()
 	}
 	return time.Now()
+}
+
+// LookupSession resolves the bundle the internal/dtls package needs to
+// accept and route an incoming DTLS handshake. sessionID is the PSK
+// identity the DTLS client put in its ClientKeyExchange (which the
+// AnyConnect protocol equates with the long-lived `webvpn` session
+// cookie). On success the returned psk is the 32-byte RFC 5705
+// exporter output computed at CSTP CONNECT time, and tunnel is the
+// active Tunnel that should adopt the new DTLS data channel.
+//
+// LookupSession returns ok=false if the session is unknown, has not
+// completed CONNECT yet, has been torn down, or otherwise has no live
+// Tunnel. The returned psk MUST NOT be mutated by callers; a fresh
+// copy is returned so internal storage cannot be observed across
+// concurrent lookups.
+//
+// LookupSession implements the SessionRegistry contract used by
+// internal/dtls.NewServer.
+func (s *Server) LookupSession(sessionID string) (psk []byte, tunnel *Tunnel, ok bool) {
+	if sessionID == "" {
+		return nil, nil, false
+	}
+	v, found := s.dtlsTunnels.Load(sessionID)
+	if !found {
+		return nil, nil, false
+	}
+	reg := v.(*dtlsRegistration)
+	if reg == nil || reg.tunnel == nil {
+		return nil, nil, false
+	}
+	// Guard against a race where the tunnel has already been closed
+	// but forgetTunnel has not yet observed the close. The dtls
+	// server can safely reject in this window; the client retries
+	// over CSTP.
+	select {
+	case <-reg.tunnel.closeCh:
+		return nil, nil, false
+	default:
+	}
+	out := make([]byte, len(reg.psk))
+	copy(out, reg.psk)
+	return out, reg.tunnel, true
+}
+
+// registerTunnel records a fresh tunnel + PSK in the DTLS lookup
+// table. Called from handleConnect once the CONNECT phase has
+// completed and the Tunnel goroutines are running. psk is the
+// 32-byte exporter material the same client just received hex-encoded
+// in X-DTLS-Master-Secret; if psk is nil (TLS exporter unavailable on
+// the request, e.g. test path), the tunnel is not registered and
+// DTLS is silently unavailable for this session.
+func (s *Server) registerTunnel(sessionToken string, psk []byte, t *Tunnel) {
+	if sessionToken == "" || len(psk) == 0 || t == nil {
+		return
+	}
+	cp := make([]byte, len(psk))
+	copy(cp, psk)
+	s.dtlsTunnels.Store(sessionToken, &dtlsRegistration{psk: cp, tunnel: t})
+}
+
+// forgetTunnel removes a tunnel from the DTLS lookup table. Called by
+// the Tunnel close path so that a closing TLS-side session is no
+// longer reachable for new DTLS handshakes. Safe to call when no
+// matching entry exists.
+func (s *Server) forgetTunnel(sessionToken string) {
+	if sessionToken == "" {
+		return
+	}
+	s.dtlsTunnels.Delete(sessionToken)
 }

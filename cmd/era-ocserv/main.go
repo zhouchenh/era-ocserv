@@ -20,32 +20,35 @@ import (
 
 	"github.com/zhouchenh/era-ocserv/internal/auth"
 	"github.com/zhouchenh/era-ocserv/internal/cstp"
+	eradtls "github.com/zhouchenh/era-ocserv/internal/dtls"
 	"github.com/zhouchenh/era-ocserv/internal/iam"
 	"github.com/zhouchenh/era-ocserv/internal/tun"
 )
 
 type config struct {
-	listenAddr     string
-	tlsCertPath    string
-	tlsKeyPath     string
-	clientCAPath   string
-	portalURL      string
-	portalToken    string
-	tpmURL         string
-	tpmToken       string
-	tunName        string
-	tunMTU         int
-	tunQueues      int
-	tunIPv6        string
-	serverName     string
-	dnsServers     string
-	defaultDomain  string
-	logLevel       string
+	listenAddr    string
+	listenUDPAddr string
+	tlsCertPath   string
+	tlsKeyPath    string
+	clientCAPath  string
+	portalURL     string
+	portalToken   string
+	tpmURL        string
+	tpmToken      string
+	tunName       string
+	tunMTU        int
+	tunQueues     int
+	tunIPv6       string
+	serverName    string
+	dnsServers    string
+	defaultDomain string
+	logLevel      string
 }
 
 func parseFlags() config {
 	var c config
 	flag.StringVar(&c.listenAddr, "listen", "127.0.0.1:8444", "loopback TCP listen address for CSTP")
+	flag.StringVar(&c.listenUDPAddr, "listen-udp", "127.0.0.1:8444", "loopback UDP listen address for DTLS data channel (empty disables DTLS)")
 	flag.StringVar(&c.tlsCertPath, "tls-cert", "", "path to TLS cert PEM (required)")
 	flag.StringVar(&c.tlsKeyPath, "tls-key", "", "path to TLS key PEM (required)")
 	flag.StringVar(&c.clientCAPath, "client-ca", "", "path to ERA PKI client CA PEM (required for mTLS)")
@@ -151,16 +154,42 @@ func run() error {
 	br := newBridge(dev, srv)
 	go br.run(ctx)
 
+	// Optional DTLS data-channel listener. The cstp.Server satisfies
+	// dtls.SessionRegistry via LookupSession, so the same Server
+	// object that minted the session token is used to authenticate
+	// the DTLS PSK identity.
+	var dtlsSrv *eradtls.Server
+	if cfg.listenUDPAddr != "" {
+		dtlsSrv, err = eradtls.NewServer(eradtls.Config{
+			Listen:   cfg.listenUDPAddr,
+			Registry: srv,
+		})
+		if err != nil {
+			return fmt.Errorf("dtls new server: %w", err)
+		}
+		go func() {
+			if err := dtlsSrv.ListenAndServe(ctx); err != nil {
+				slog.Error("dtls serve", "err", err)
+			}
+		}()
+	}
+
 	go func() {
 		<-ctx.Done()
 		slog.Info("shutdown signal received")
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
 		httpSrv.Shutdown(shutdownCtx)
+		if dtlsSrv != nil {
+			_ = dtlsSrv.Close()
+		}
 		srv.Close()
 	}()
 
-	slog.Info("era-ocserv listening", "addr", cfg.listenAddr, "server_name", cfg.serverName)
+	slog.Info("era-ocserv listening",
+		"tcp", cfg.listenAddr,
+		"udp", cfg.listenUDPAddr,
+		"server_name", cfg.serverName)
 	if err := httpSrv.Serve(tlsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("http serve: %w", err)
 	}

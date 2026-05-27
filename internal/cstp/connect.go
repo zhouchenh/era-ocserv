@@ -76,6 +76,13 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	s.sessions.consume(sess)
 	t := s.newTunnel(conn, rw, id, sess.token)
+	// Register the tunnel for DTLS lookup if we successfully derived
+	// a PSK from the outer TLS exporter; otherwise the DTLS channel
+	// silently stays unavailable for this session and the client
+	// uses CSTP-over-TLS for both control and data.
+	if dtlsOK {
+		s.registerTunnel(sess.token, dtlsSecret, t)
+	}
 	select {
 	case s.tunnels <- t:
 	case <-s.closeCh:

@@ -29,6 +29,16 @@ import (
 // Data frames (AC_PKT_DATA) are surfaced through ReadPacket /
 // WritePacket. Compressed frames are rejected with errCompressedFrame
 // because era-ocserv does not negotiate CSTP compression per ADR 0057.
+//
+// Data plane (DTLS attachment). When a DTLS data channel has been
+// completed for the same session (see AttachDTLS), subsequent
+// WritePacket calls emit a 1-byte-typed DTLS-framed packet on the
+// attached UDP conn instead of an 8-byte CSTP frame on the TLS conn.
+// Control frames (DPD/keepalive/disconnect) continue to be emitted on
+// the CSTP/TLS channel via the heartbeat goroutine. Inbound DTLS data
+// is fed back into the same dataCh by the DTLS server via
+// InjectInbound, so ReadPacket consumers do not need to be aware of
+// which channel a given frame arrived on.
 type Tunnel struct {
 	server *Server
 	conn   net.Conn
@@ -39,14 +49,23 @@ type Tunnel struct {
 	sessionID string
 
 	// dataCh carries inbound AC_PKT_DATA frames from the reader
-	// goroutine to ReadPacket callers. Buffered modestly to absorb
-	// short bursts without blocking the reader.
+	// goroutines (CSTP readLoop and, when attached, the DTLS server)
+	// to ReadPacket callers. Buffered modestly to absorb short bursts
+	// without blocking the reader.
 	dataCh chan []byte
 
-	// writeMu serializes Writes to the underlying conn. The heartbeat
-	// goroutine and WritePacket both need to emit frames; the
-	// underlying TLS conn is not safe for concurrent Write.
+	// writeMu serializes Writes to the underlying CSTP/TLS conn. The
+	// heartbeat goroutine and WritePacket both need to emit frames;
+	// the underlying TLS conn is not safe for concurrent Write.
 	writeMu sync.Mutex
+
+	// dtls holds the active DTLS data-channel attachment when present.
+	// Loaded atomically by WritePacket to decide whether to emit a
+	// DTLS-framed packet (preferred when set) or a CSTP-framed packet
+	// on the TLS conn. Mutated under attachMu so AttachDTLS/DetachDTLS
+	// observe a single in-flight transition at a time.
+	dtls     atomic.Pointer[dtlsAttachment]
+	attachMu sync.Mutex
 
 	// lastInbound / lastOutbound are unix nanos updated by the reader
 	// and writer hot paths. The heartbeat goroutine polls them through
@@ -54,14 +73,25 @@ type Tunnel struct {
 	lastInbound  atomic.Int64
 	lastOutbound atomic.Int64
 
-	closeOnce sync.Once
-	closeCh   chan struct{}
-	closeErr  atomic.Pointer[error]
+	closeOnce  sync.Once
+	closeCh    chan struct{}
+	dataChOnce sync.Once
+	closeErr   atomic.Pointer[error]
 
 	dpdInterval       time.Duration
 	keepaliveInterval time.Duration
 	idleTimeout       time.Duration
 	nowFn             func() time.Time
+}
+
+// dtlsAttachment is the per-tunnel handle the DTLS server installs
+// on a Tunnel after a successful PSK handshake. The conn is a
+// pion/dtls *Conn (satisfying net.Conn). writeMu serializes
+// concurrent Write calls because the DTLS conn, like a TLS conn,
+// is not safe for parallel Write.
+type dtlsAttachment struct {
+	conn    net.Conn
+	writeMu sync.Mutex
 }
 
 // errCompressedFrame is returned to the caller via ReadPacket if the
@@ -136,14 +166,105 @@ func (t *Tunnel) ReadPacket(p []byte) (int, error) {
 	}
 }
 
-// WritePacket frames p as an AC_PKT_DATA frame and writes it on the
-// CSTP channel. Concurrent calls are safe; they serialize through an
-// internal mutex.
+// WritePacket frames p as an AC_PKT_DATA packet and writes it on the
+// preferred data channel: the attached DTLS conn if AttachDTLS has been
+// called and the conn is still alive, otherwise the original CSTP/TLS
+// conn. Concurrent calls are safe; each path serializes through its
+// own mutex.
+//
+// If a DTLS write fails (transient UDP issue, peer reset), the failure
+// is returned to the caller and the attachment is left in place — the
+// caller (typically the bridge) treats this as a per-frame drop, not a
+// session failure. Permanent DTLS failures are detected by the DTLS
+// server's per-conn read loop, which calls DetachDTLS to fall back to
+// CSTP for subsequent writes.
 func (t *Tunnel) WritePacket(p []byte) (int, error) {
+	if att := t.dtls.Load(); att != nil {
+		if err := t.writeDTLSFrame(att, pktData, p); err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	}
 	if err := t.writeFrame(pktData, p); err != nil {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+// AttachDTLS swaps the tunnel's data plane from CSTP-over-TLS to the
+// supplied DTLS conn. After this call returns, WritePacket emits
+// 1-byte-typed DTLS frames on conn instead of 8-byte CSTP frames on
+// the TLS conn. Control-plane frames (DPD, keepalive, disconnect)
+// continue to be emitted on the TLS conn by the heartbeat goroutine
+// for stability — the AnyConnect protocol assumes the TCP control
+// channel stays alive even when DTLS is the data path.
+//
+// The returned prev is the conn that was acting as the data channel
+// immediately before AttachDTLS — for the typical "first DTLS handshake
+// for a tunnel" path this is the original TLS conn. The caller does not
+// need to do anything with prev: control traffic still uses it via the
+// tunnel's existing read/write paths. prev is returned for diagnostics
+// and to make rare DTLS-replaces-DTLS transitions observable in tests.
+//
+// AttachDTLS does not start any reader on conn; the caller (the DTLS
+// server) drives reads itself and pushes inbound data frames through
+// InjectInbound.
+func (t *Tunnel) AttachDTLS(conn net.Conn) (prev net.Conn) {
+	if conn == nil {
+		return nil
+	}
+	t.attachMu.Lock()
+	defer t.attachMu.Unlock()
+	// Refuse to attach to a tunnel that has already closed; the
+	// caller (the DTLS server) checks the return for nil and closes
+	// its conn. Without this guard a late attachment would linger
+	// past closeWithErr and prevent garbage collection of the DTLS
+	// conn until the next WritePacket attempt.
+	select {
+	case <-t.closeCh:
+		return nil
+	default:
+	}
+	if old := t.dtls.Swap(&dtlsAttachment{conn: conn}); old != nil {
+		return old.conn
+	}
+	return t.conn
+}
+
+// DetachDTLS reverts the data plane to CSTP-over-TLS. Subsequent
+// WritePacket calls emit CSTP frames on the original TLS conn again.
+// Called by the DTLS server's per-conn loop when the DTLS conn closes
+// (clean shutdown, idle timeout, or read error). The tunnel itself
+// stays alive — only the data-plane preference is unwound. If no
+// DTLS attachment is active, DetachDTLS is a no-op.
+func (t *Tunnel) DetachDTLS() {
+	t.attachMu.Lock()
+	defer t.attachMu.Unlock()
+	t.dtls.Store(nil)
+}
+
+// InjectInbound delivers a payload p (a raw IP packet decoded from a
+// DTLS data frame on the attached conn) to ReadPacket consumers. The
+// payload is copied so the caller can reuse its scratch buffer
+// immediately. Returns false if the tunnel has been closed (the
+// caller should also exit its DTLS read loop).
+//
+// Inbound DTLS control frames (DPD/keepalive/disconnect) are NOT
+// routed through this method; the DTLS server handles them itself
+// per the protocol (echo DPD, drop keepalive, signal disconnect).
+func (t *Tunnel) InjectInbound(p []byte) bool {
+	if len(p) == 0 {
+		return true
+	}
+	pkt := make([]byte, len(p))
+	copy(pkt, p)
+	t.lastInbound.Store(t.now().UnixNano())
+	select {
+	case t.dataCh <- pkt:
+		return true
+	case <-t.closeCh:
+		return false
+	}
 }
 
 // Close stops the heartbeat goroutine, closes the underlying conn,
@@ -158,7 +279,22 @@ func (t *Tunnel) closeWithErr(cause error) error {
 			t.closeErr.Store(&cause)
 		}
 		close(t.closeCh)
+		// Drop the DTLS attachment and close the DTLS conn if any,
+		// so the DTLS server's per-conn loop unblocks promptly.
+		if att := t.dtls.Swap(nil); att != nil {
+			_ = att.conn.Close()
+		}
 		_ = t.conn.Close()
+		// Close dataCh exactly once so all producers (CSTP readLoop
+		// and any DTLS-side InjectInbound caller) observe a clean
+		// shutdown without panicking on a closed channel.
+		t.dataChOnce.Do(func() { close(t.dataCh) })
+		// Drop the tunnel from the DTLS lookup so a late-arriving
+		// DTLS handshake on this session token gets an unknown-session
+		// answer rather than a freshly-closed tunnel.
+		if t.server != nil {
+			t.server.forgetTunnel(t.sessionID)
+		}
 	})
 	return nil
 }
@@ -182,12 +318,11 @@ func (t *Tunnel) now() time.Time {
 // handled inline (DPD response, disconnect ack). A malformed frame
 // tears the tunnel down because the stream is no longer aligned.
 func (t *Tunnel) readLoop() {
-	defer func() {
-		// Closing dataCh wakes ReadPacket callers with the
-		// closeCause. We deliberately do not nil-out t.dataCh; the
-		// receive side handles the closed-channel case.
-		close(t.dataCh)
-	}()
+	// dataCh is closed centrally in closeWithErr so that DTLS-side
+	// producers (InjectInbound) and the CSTP readLoop can both exit
+	// safely without racing on close. ReadPacket already selects on
+	// closeCh as a secondary wakeup path, so the channel close itself
+	// is mainly a hygiene signal.
 
 	hdr := make([]byte, frameHeaderLen)
 	buf := make([]byte, 1<<16) // max possible CSTP payload
@@ -304,6 +439,41 @@ func (t *Tunnel) heartbeatLoop() {
 			}
 		}
 	}
+}
+
+// writeDTLSFrame frames typ + payload as a DTLS-side AnyConnect packet
+// (1-byte type + raw payload, per protocol doc §2.3) and writes it as
+// a single datagram on the DTLS conn held in att. Writes are
+// serialized through att.writeMu because pion's *dtls.Conn (like
+// crypto/tls) is not safe for concurrent Write.
+//
+// On write error the caller (WritePacket) returns the error to the
+// bridge but does NOT detach the DTLS attachment automatically: a
+// transient EAGAIN on the underlying UDP socket is not a session
+// failure. Permanent failures are surfaced by the DTLS server's
+// per-conn read loop.
+func (t *Tunnel) writeDTLSFrame(att *dtlsAttachment, typ byte, payload []byte) error {
+	if len(payload) > maxFramePayload {
+		return errFrameTooLarge
+	}
+	buf := make([]byte, 1+len(payload))
+	buf[0] = typ
+	copy(buf[1:], payload)
+
+	att.writeMu.Lock()
+	defer att.writeMu.Unlock()
+
+	select {
+	case <-t.closeCh:
+		return errTunnelClosed
+	default:
+	}
+
+	if _, err := att.conn.Write(buf); err != nil {
+		return err
+	}
+	t.lastOutbound.Store(t.now().UnixNano())
+	return nil
 }
 
 // writeFrame frames typ + payload as a CSTP frame and flushes it on
