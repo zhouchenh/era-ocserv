@@ -1,6 +1,7 @@
 package cstp
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -50,15 +51,32 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	innerMTU := negotiateInnerMTU(r, mtu)
 
-	// Try to derive a DTLS PSK from the outer TLS handshake. If the
-	// underlying conn isn't a *tls.Conn (test path, plain TCP), this
-	// silently downgrades to TCP-only CSTP.
-	dtlsSecret, dtlsOK := deriveDTLSSecret(r)
-
 	headers := w.Header()
 	emitCSTPHeaders(headers, s.cfg, id, innerMTU)
-	if dtlsOK {
-		emitDTLSHeaders(headers, dtlsSecret, innerMTU)
+	var tunnelDTLS *dtlsBindingState
+	if s.cfg.DTLSBindingInstaller != nil && s.cfg.DTLSBindingSource != nil {
+		if binding, ok := s.cfg.DTLSBindingSource(r, id); ok {
+			if secret, err := issueDTLSSecret(s.cfg.RandRead); err == nil {
+				binding.PSK = secret
+				if err := s.cfg.DTLSBindingInstaller.Upsert(r.Context(), binding); err == nil {
+					emitDTLSHeaders(headers, secret[:], innerMTU)
+					tunnelDTLS = &dtlsBindingState{
+						installer:       s.cfg.DTLSBindingInstaller,
+						binding:         binding,
+						refreshInterval: s.cfg.DTLSBindingRefreshInterval,
+					}
+				}
+			}
+		}
+	}
+	if tunnelDTLS == nil {
+		// Legacy fallback: when shared-edge binding publication is unavailable,
+		// keep the old exporter-based path so loopback TLS mode still advertises
+		// DTLS when the outer connection exposes RFC 5705 exporter material.
+		dtlsSecret, dtlsOK := deriveDTLSSecret(r)
+		if dtlsOK {
+			emitDTLSHeaders(headers, dtlsSecret, innerMTU)
+		}
 	}
 
 	// http.ResponseWriter ignores 200 on CONNECT by default; we
@@ -75,13 +93,22 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.sessions.consume(sess)
-	t := s.newTunnel(conn, rw, id, sess.token)
+	t := s.newTunnel(conn, rw, id, sess.token, tunnelDTLS)
 	select {
 	case s.tunnels <- t:
 	case <-s.closeCh:
 		_ = t.Close()
 		return
 	}
+}
+
+func issueDTLSSecret(randRead func(p []byte) (int, error)) ([32]byte, error) {
+	if randRead == nil {
+		randRead = rand.Read
+	}
+	var secret [32]byte
+	_, err := randRead(secret[:])
+	return secret, err
 }
 
 // extractWebVPNCookie pulls the AnyConnect session cookie out of the

@@ -28,24 +28,26 @@ import (
 )
 
 type config struct {
-	mode          string
-	udsSocketPath string
-	listenAddr    string
-	tlsCertPath   string
-	tlsKeyPath    string
-	clientCAPath  string
-	portalURL     string
-	portalToken   string
-	tpmURL        string
-	tpmToken      string
-	tunName       string
-	tunMTU        int
-	tunQueues     int
-	tunIPv6       string
-	serverName    string
-	dnsServers    string
-	defaultDomain string
-	logLevel      string
+	mode             string
+	udsSocketPath    string
+	listenAddr       string
+	tlsCertPath      string
+	tlsKeyPath       string
+	clientCAPath     string
+	portalURL        string
+	portalToken      string
+	tpmURL           string
+	tpmToken         string
+	tunName          string
+	tunMTU           int
+	tunQueues        int
+	tunIPv6          string
+	serverName       string
+	dnsServers       string
+	defaultDomain    string
+	logLevel         string
+	facadeAdminURL   string
+	facadeAdminToken string
 	// dtlsUDSSocket, when non-empty, enables the ADR-F7 Wave IV (stream O-S)
 	// AnyConnect-DTLS UDS DGRAM consumer alongside whichever CSTP listener
 	// the resolved -mode picks. era-facade decrypts DTLS upstream and hands
@@ -78,6 +80,8 @@ func parseFlags() config {
 	flag.StringVar(&c.dnsServers, "dns", "2606:4700:4700::1111,2606:4700:4700::1001", "comma-separated DNS servers pushed via X-CSTP-DNS")
 	flag.StringVar(&c.defaultDomain, "default-domain", "", "DNS default domain pushed via X-CSTP-Default-Domain")
 	flag.StringVar(&c.logLevel, "log-level", "info", "log level: debug|info|warn|error")
+	flag.StringVar(&c.facadeAdminURL, "facade-admin-url", "", "era-facade admin base URL for shared-edge DTLS bindings (e.g. http://127.0.0.1:8780)")
+	flag.StringVar(&c.facadeAdminToken, "facade-admin-token", "", "era-facade admin service token used to publish shared-edge DTLS bindings")
 	flag.StringVar(&c.dtlsUDSSocket, "dtls-uds-socket", "",
 		"DTLS UDS DGRAM socket path (Wave IV O-S). Empty disables. "+
 			"Pass 'default' to use the canonical "+dtlsuds.DefaultSocketPath+".")
@@ -190,17 +194,37 @@ func run() error {
 		return fmt.Errorf("parse dns: %w", err)
 	}
 
+	var dtlsBindings cstp.DTLSBindingInstaller
+	if strings.TrimSpace(cfg.facadeAdminURL) != "" || strings.TrimSpace(cfg.facadeAdminToken) != "" {
+		if strings.TrimSpace(cfg.facadeAdminURL) == "" || strings.TrimSpace(cfg.facadeAdminToken) == "" {
+			return fmt.Errorf("facade dtls binding config requires both -facade-admin-url and -facade-admin-token")
+		}
+		facadeBase, err := url.Parse(cfg.facadeAdminURL)
+		if err != nil {
+			return fmt.Errorf("parse facade-admin-url: %w", err)
+		}
+		dtlsBindings, err = cstp.NewHTTPDTLSBindingInstaller(cstp.HTTPDTLSBindingInstallerConfig{
+			BaseURL:      facadeBase,
+			ServiceToken: cfg.facadeAdminToken,
+		})
+		if err != nil {
+			return err
+		}
+	}
+
 	srv := cstp.NewServer(cstp.Config{
-		Verifier:          hv,
-		Resolver:          resolverAdapter{inner: tpmResolver},
-		ServerName:        cfg.serverName,
-		DNS:               dns,
-		DefaultDomain:     cfg.defaultDomain,
-		DefaultMTU:        cfg.tunMTU,
-		DPDInterval:       30,
-		KeepaliveInterval: 20,
-		IdleTimeout:       1800,
-		SessionTimeout:    24 * time.Hour,
+		Verifier:             hv,
+		Resolver:             resolverAdapter{inner: tpmResolver},
+		ServerName:           cfg.serverName,
+		DNS:                  dns,
+		DefaultDomain:        cfg.defaultDomain,
+		DefaultMTU:           cfg.tunMTU,
+		DPDInterval:          30,
+		KeepaliveInterval:    20,
+		IdleTimeout:          1800,
+		SessionTimeout:       24 * time.Hour,
+		DTLSBindingInstaller: dtlsBindings,
+		DTLSBindingSource:    sharedEdgeDTLSBindingSource,
 	})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -449,4 +473,24 @@ func (r resolverAdapter) Resolve(ctx context.Context, deviceID string) (cstp.Ide
 		IPv6:     id.IPv6,
 		MTU:      id.MTU,
 	}, nil
+}
+
+func sharedEdgeDTLSBindingSource(r *http.Request, id cstp.Identity) (cstp.DTLSBinding, bool) {
+	info, ok := udsserve.FromContext(r.Context())
+	if !ok || info == nil {
+		return cstp.DTLSBinding{}, false
+	}
+	if !info.ClientSrc.Addr().IsValid() || info.SubjectDN == "" || info.UserID == "" || !info.SourceHintV6.IsValid() || len(info.Token) != 12 {
+		return cstp.DTLSBinding{}, false
+	}
+	var token [12]byte
+	copy(token[:], info.Token)
+	return cstp.DTLSBinding{
+		SourceIP:      info.ClientSrc.Addr().Unmap(),
+		DeviceID:      id.DeviceID,
+		UserID:        info.UserID,
+		MTLSSubjectDN: info.SubjectDN,
+		SourceV6:      info.SourceHintV6,
+		Token:         token,
+	}, true
 }

@@ -2,6 +2,7 @@ package cstp
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -37,6 +38,7 @@ type Tunnel struct {
 
 	identity  Identity
 	sessionID string
+	dtls      *dtlsBindingState
 
 	// dataCh carries inbound AC_PKT_DATA frames from the reader
 	// goroutine to ReadPacket callers. Buffered modestly to absorb
@@ -64,6 +66,14 @@ type Tunnel struct {
 	nowFn             func() time.Time
 }
 
+type dtlsBindingState struct {
+	installer       DTLSBindingInstaller
+	binding         DTLSBinding
+	refreshInterval time.Duration
+	lastRefreshUnix atomic.Int64
+	refreshing      atomic.Bool
+}
+
 // errCompressedFrame is returned to the caller via ReadPacket if the
 // client sends a compressed frame even though we did not advertise
 // any compression. Real Cisco SC and OpenConnect respect our omission
@@ -82,7 +92,7 @@ var errClientDisconnect = errors.New("cstp: client requested disconnect")
 // the reader + heartbeat goroutines. The bufio.ReadWriter handed to
 // us by hijack already contains the post-CONNECT bytes the http server
 // buffered; we reuse it to avoid losing those bytes.
-func (s *Server) newTunnel(conn net.Conn, rw *bufio.ReadWriter, id Identity, sessionToken string) *Tunnel {
+func (s *Server) newTunnel(conn net.Conn, rw *bufio.ReadWriter, id Identity, sessionToken string, dtlsState *dtlsBindingState) *Tunnel {
 	now := s.now()
 	t := &Tunnel{
 		server:            s,
@@ -91,6 +101,7 @@ func (s *Server) newTunnel(conn net.Conn, rw *bufio.ReadWriter, id Identity, ses
 		br:                rw.Reader,
 		identity:          id,
 		sessionID:         sessionToken,
+		dtls:              dtlsState,
 		dataCh:            make(chan []byte, 64),
 		closeCh:           make(chan struct{}),
 		dpdInterval:       time.Duration(s.cfg.DPDInterval) * time.Second,
@@ -100,6 +111,9 @@ func (s *Server) newTunnel(conn net.Conn, rw *bufio.ReadWriter, id Identity, ses
 	}
 	t.lastInbound.Store(now.UnixNano())
 	t.lastOutbound.Store(now.UnixNano())
+	if t.dtls != nil {
+		t.dtls.lastRefreshUnix.Store(now.UnixNano())
+	}
 
 	go t.readLoop()
 	go t.heartbeatLoop()
@@ -269,6 +283,7 @@ func (t *Tunnel) heartbeatLoop() {
 			now := t.now()
 			lastIn := time.Unix(0, t.lastInbound.Load())
 			lastOut := time.Unix(0, t.lastOutbound.Load())
+			t.maybeRefreshDTLSBinding(now)
 
 			if t.idleTimeout > 0 && now.Sub(lastIn) > t.idleTimeout {
 				_ = t.writeFrame(pktDisconnect, []byte{0})
@@ -304,6 +319,27 @@ func (t *Tunnel) heartbeatLoop() {
 			}
 		}
 	}
+}
+
+func (t *Tunnel) maybeRefreshDTLSBinding(now time.Time) {
+	if t.dtls == nil || t.dtls.installer == nil || t.dtls.refreshInterval <= 0 {
+		return
+	}
+	last := time.Unix(0, t.dtls.lastRefreshUnix.Load())
+	if now.Sub(last) < t.dtls.refreshInterval {
+		return
+	}
+	if !t.dtls.refreshing.CompareAndSwap(false, true) {
+		return
+	}
+	go func(binding DTLSBinding) {
+		defer t.dtls.refreshing.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := t.dtls.installer.Upsert(ctx, binding); err == nil {
+			t.dtls.lastRefreshUnix.Store(time.Now().UnixNano())
+		}
+	}(t.dtls.binding)
 }
 
 // writeFrame frames typ + payload as a CSTP frame and flushes it on

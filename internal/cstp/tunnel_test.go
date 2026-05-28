@@ -53,7 +53,7 @@ func pipeTunnel(t *testing.T, fc *fakeClock, cfg Config) (*Tunnel, net.Conn) {
 	bw := bufio.NewWriter(serverConn)
 	rw := bufio.NewReadWriter(br, bw)
 	id := Identity{DeviceID: "d", IPv6: netip.MustParsePrefix("2001:db8::1/128"), MTU: 1406}
-	tun := s.newTunnel(serverConn, rw, id, "session-token-xyz")
+	tun := s.newTunnel(serverConn, rw, id, "session-token-xyz", nil)
 	return tun, clientConn
 }
 

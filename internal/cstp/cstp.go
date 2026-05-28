@@ -16,6 +16,7 @@ package cstp
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/netip"
 	"sync"
 	"time"
@@ -105,6 +106,15 @@ type Config struct {
 	// RandRead allows tests to inject a deterministic CSPRNG. Production
 	// leaves it nil and the package falls back to crypto/rand.Read.
 	RandRead func(p []byte) (int, error)
+
+	// DTLSBindingInstaller, when non-nil, enables shared-edge DTLS by publishing
+	// the CSTP-authenticated DTLS binding into era-facade's admin API.
+	DTLSBindingInstaller DTLSBindingInstaller
+	DTLSBindingSource    func(*http.Request, Identity) (DTLSBinding, bool)
+	// DTLSBindingRefreshInterval controls how often an established CSTP tunnel
+	// refreshes its DTLS binding in the background so the facade-side 5-minute
+	// binding TTL stays alive as long as the CSTP leg does.
+	DTLSBindingRefreshInterval time.Duration
 }
 
 // Server is an http.Handler that drives the CSTP phase-2 XML
@@ -191,6 +201,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.SessionTimeout <= 0 {
 		c.SessionTimeout = time.Hour
+	}
+	if c.DTLSBindingRefreshInterval <= 0 {
+		c.DTLSBindingRefreshInterval = 2 * time.Minute
 	}
 	return c
 }
