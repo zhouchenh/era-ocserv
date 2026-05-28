@@ -22,19 +22,11 @@ import (
 // platforms without /var/run).
 const SocketRoot = "/var/run/era-facade/handoffs"
 
-// SocketFileMode is the per-spec UDS socket file permission (§2.2). The
-// default is "0600 + supplementary-group membership"; deployments may
-// alternatively pick 0660 with `chgrp era-backend`. The framework writes
-// 0600; if the operator requires 0660 they bind the socket themselves and
-// pass it in via *ListenerOptions.PreboundListener.
-//
-// systemd-side socket-activation deployments should:
-//   - User=era-facade Group=era-facade for the facade unit.
-//   - User=<backend> Group=era-backend SupplementaryGroups=era-facade for the
-//     backend unit. (Backend reads/writes the 0600 socket via group
-//     membership.)
-//   - Directory mode 0710 owned era-facade:era-backend (§2.2).
-const SocketFileMode os.FileMode = 0o600
+// SocketFileMode is the default UDS socket file permission for the shared
+// handoff directory. Production runs ocserv as root and facade as
+// era-facade, so the socket needs group read/write access after the socket
+// inherits the handoff directory's group.
+const SocketFileMode os.FileMode = 0o660
 
 // HeaderReadTimeout bounds how long the listener waits for the PROXY-v2 +
 // TLV prefix on a freshly-accepted UDS connection before giving up. The
@@ -130,7 +122,7 @@ func bindStream(path string) (net.Listener, error) {
 		return nil, errors.New("empty socket path")
 	}
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o710); err != nil {
+	if err := os.MkdirAll(dir, 0o2775); err != nil {
 		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 	// Best-effort remove of a stale socket file. On non-Linux dev hosts the

@@ -69,7 +69,7 @@ func bindDatagram(path string) (net.PacketConn, error) {
 		return nil, errors.New("empty socket path")
 	}
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o710); err != nil {
+	if err := os.MkdirAll(dir, 0o2775); err != nil {
 		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 	_ = os.Remove(path)
