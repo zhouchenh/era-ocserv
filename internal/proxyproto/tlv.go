@@ -272,7 +272,12 @@ func ValidateTLV(t TLV) error {
 			return fmt.Errorf("EraTLVToken: length %d != 12", len(t.Value))
 		}
 		return nil
-	case EraTLVDeviceID, EraTLVVLESSUUID:
+	case EraTLVDeviceID:
+		if !isCanonicalUUID(t.Value) && !isLegacyDeviceID(t.Value) {
+			return fmt.Errorf("EraTLVDeviceID: invalid stable device identifier")
+		}
+		return nil
+	case EraTLVVLESSUUID:
 		// 36 bytes, canonical RFC 4122 form: lowercase hex with hyphens at
 		// positions 8, 13, 18, 23.
 		if len(t.Value) != 36 {
@@ -405,6 +410,22 @@ func isCanonicalUUID(v []byte) bool {
 			if !((b >= '0' && b <= '9') || (b >= 'a' && b <= 'f')) {
 				return false
 			}
+		}
+	}
+	return true
+}
+
+func isLegacyDeviceID(v []byte) bool {
+	if len(v) < 5 || len(v) > 64 {
+		return false
+	}
+	if !strings.HasPrefix(string(v), "dev-") && !strings.HasPrefix(string(v), "dev_") {
+		return false
+	}
+	for i := 4; i < len(v); i++ {
+		c := v[i]
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return false
 		}
 	}
 	return true

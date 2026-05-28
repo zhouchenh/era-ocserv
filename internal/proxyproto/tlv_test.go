@@ -140,6 +140,12 @@ func TestValidateTLV_DeviceID(t *testing.T) {
 	if err := ValidateTLV(TLV{Type: EraTLVDeviceID, Value: good}); err != nil {
 		t.Errorf("valid UUID: %v", err)
 	}
+	if err := ValidateTLV(TLV{Type: EraTLVDeviceID, Value: []byte("dev-42")}); err != nil {
+		t.Errorf("valid legacy device id: %v", err)
+	}
+	if err := ValidateTLV(TLV{Type: EraTLVDeviceID, Value: []byte("dev_aaaaaaaaaaaaaaaaaaaaaaaaaa")}); err != nil {
+		t.Errorf("valid tpm-style device id: %v", err)
+	}
 	if err := ValidateTLV(TLV{Type: EraTLVDeviceID, Value: []byte("123E4567-E89B-12D3-A456-426614174000")}); err == nil {
 		t.Errorf("expected err for uppercase UUID")
 	}
