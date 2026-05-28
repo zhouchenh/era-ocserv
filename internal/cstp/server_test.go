@@ -168,6 +168,16 @@ func TestPhase2HappyPath(t *testing.T) {
 	if !strings.Contains(string(body), `type="complete"`) {
 		t.Fatalf("expected complete, got: %s", body)
 	}
+	foundWebVPN := false
+	for _, c := range resp.Cookies() {
+		if c.Name == "webvpn" && c.Value != "" {
+			foundWebVPN = true
+			break
+		}
+	}
+	if !foundWebVPN {
+		t.Fatalf("missing webvpn auth cookie")
+	}
 	token := extractSessionToken(string(body))
 	if token == "" {
 		t.Fatalf("missing session token in: %s", body)

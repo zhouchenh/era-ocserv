@@ -63,6 +63,7 @@ type authOpaque struct {
 
 type authBlock struct {
 	ID       string    `xml:"id,attr,omitempty"`
+	Title    string    `xml:"title,omitempty"`
 	Message  string    `xml:"message,omitempty"`
 	Form     *authForm `xml:"form,omitempty"`
 	Username string    `xml:"username,omitempty"`
@@ -174,6 +175,7 @@ func buildAuthComplete(sessionToken, opaqueID, certHashBase64 string) ([]byte, e
 		SessionID:    opaqueID,
 		Auth: &authBlock{
 			ID:      "success",
+			Title:   "SSL VPN Service",
 			Message: "Logged in",
 		},
 	}

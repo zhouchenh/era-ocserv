@@ -122,6 +122,13 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal", http.StatusInternalServerError)
 		return
 	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "webvpn",
+		Value:    promoted.token,
+		Path:     "/",
+		Secure:   true,
+		HttpOnly: true,
+	})
 	body, err := buildAuthComplete(promoted.token, promoted.opaqueID, "")
 	if err != nil {
 		http.Error(w, "internal", http.StatusInternalServerError)

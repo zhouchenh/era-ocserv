@@ -87,6 +87,9 @@ func TestBuildAuthCompleteRoundTrip(t *testing.T) {
 	if !strings.Contains(s, "<session-token>session-token-blob</session-token>") {
 		t.Fatalf("missing session token: %s", s)
 	}
+	if !strings.Contains(s, "<title>SSL VPN Service</title>") {
+		t.Fatalf("missing success title: %s", s)
+	}
 }
 
 func TestBuildAuthErrorIncludesPromptAndForm(t *testing.T) {
