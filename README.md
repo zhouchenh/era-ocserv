@@ -29,7 +29,12 @@ The default `-mode=auto` chooses UDS if the facade's handoff directory
 
 ## Status
 
-Stage 1 + ADR-F7 Wave II (CSTP UDS bridge). DTLS lifted to facade in Stage 5.
+Shared-apex CSTP is the shipping path: facade owns `eracloud.app:443`, validates
+the token-prefixed URL, and hands plaintext CSTP to era-ocserv over UDS.
+
+The DTLS consumer code exists in-tree, but the facade-owned apex DTLS binding
+path is not fully wired end-to-end yet, so live deployments should treat CSTP
+as the ready path today.
 
 ## Reference
 

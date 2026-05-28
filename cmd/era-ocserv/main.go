@@ -74,7 +74,7 @@ func parseFlags() config {
 	flag.IntVar(&c.tunMTU, "tun-mtu", 1500, "tun MTU")
 	flag.IntVar(&c.tunQueues, "tun-queues", 0, "tun queue count (0 = default min(NumCPU, 4))")
 	flag.StringVar(&c.tunIPv6, "tun-ipv6", "", "tun's own /128 IPv6 (e.g. 2001:470:f9d1:9001:ffff::1/128); empty leaves unset")
-	flag.StringVar(&c.serverName, "server-name", "vpn.eracloud.app", "SNI / server name advertised in CSTP")
+	flag.StringVar(&c.serverName, "server-name", "eracloud.app", "server name advertised in CSTP")
 	flag.StringVar(&c.dnsServers, "dns", "2606:4700:4700::1111,2606:4700:4700::1001", "comma-separated DNS servers pushed via X-CSTP-DNS")
 	flag.StringVar(&c.defaultDomain, "default-domain", "", "DNS default domain pushed via X-CSTP-Default-Domain")
 	flag.StringVar(&c.logLevel, "log-level", "info", "log level: debug|info|warn|error")
@@ -237,7 +237,7 @@ func run() error {
 // the bridge as its session-lifecycle callback so the /128 lookup picks
 // the DTLS transport for outbound traffic. The DTLS listener runs
 // regardless of the CSTP -mode (uds or legacy) — DTLS termination always
-// happens at the facade in ADR-F7 Stage 5.
+// happens through the facade-owned shared apex path.
 //
 // Returns (nil, nil) when DTLS is disabled. Returns (nil, err) on bind
 // failure.
