@@ -140,6 +140,10 @@ func buildAuthRequest(opaqueID, prompt string) ([]byte, error) {
 		Client: "vpn",
 		Type:   authTypeAuthRequest,
 		AggVer: "2",
+		Version: &authVersion{
+			Who:   "sg",
+			Value: "0.1(1)",
+		},
 		Opaque: &authOpaque{IsFor: "sg", SessionID: opaqueID},
 		Auth: &authBlock{
 			ID:      "main",
@@ -165,6 +169,7 @@ func buildAuthComplete(sessionToken, opaqueID, certHashBase64 string) ([]byte, e
 		Client:       "vpn",
 		Type:         authTypeComplete,
 		AggVer:       "2",
+		Version:      &authVersion{Who: "sg", Value: "0.1(1)"},
 		SessionToken: sessionToken,
 		SessionID:    opaqueID,
 		Auth: &authBlock{
@@ -192,6 +197,10 @@ func buildAuthError(opaqueID, message string) ([]byte, error) {
 		Client: "vpn",
 		Type:   authTypeAuthRequest,
 		AggVer: "2",
+		Version: &authVersion{
+			Who:   "sg",
+			Value: "0.1(1)",
+		},
 		Opaque: &authOpaque{IsFor: "sg", SessionID: opaqueID},
 		Auth: &authBlock{
 			ID:      "main",
