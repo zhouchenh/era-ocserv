@@ -43,6 +43,7 @@ type config struct {
 	tunQueues        int
 	tunIPv6          string
 	serverName       string
+	serverCertSHA1   string
 	dnsServers       string
 	defaultDomain    string
 	logLevel         string
@@ -77,6 +78,7 @@ func parseFlags() config {
 	flag.IntVar(&c.tunQueues, "tun-queues", 0, "tun queue count (0 = default min(NumCPU, 4))")
 	flag.StringVar(&c.tunIPv6, "tun-ipv6", "", "tun's own /128 IPv6 (e.g. 2001:470:f9d1:9001:ffff::1/128); empty leaves unset")
 	flag.StringVar(&c.serverName, "server-name", "eracloud.app", "server name advertised in CSTP")
+	flag.StringVar(&c.serverCertSHA1, "server-cert-sha1", "", "(covert :443) uppercase-hex SHA-1 of the facade's public TLS leaf for the webvpnc sh: pin; empty uses the built-in eracloud.app constant")
 	flag.StringVar(&c.dnsServers, "dns", "2606:4700:4700::1111,2606:4700:4700::1001", "comma-separated DNS servers pushed via X-CSTP-DNS")
 	flag.StringVar(&c.defaultDomain, "default-domain", "", "DNS default domain pushed via X-CSTP-Default-Domain")
 	flag.StringVar(&c.logLevel, "log-level", "info", "log level: debug|info|warn|error")
@@ -216,6 +218,7 @@ func run() error {
 		Verifier:             hv,
 		Resolver:             resolverAdapter{inner: tpmResolver},
 		ServerName:           cfg.serverName,
+		ServerCertSHA1:       cfg.serverCertSHA1,
 		DNS:                  dns,
 		DefaultDomain:        cfg.defaultDomain,
 		DefaultMTU:           cfg.tunMTU,

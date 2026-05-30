@@ -243,7 +243,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	// directive with a 1970-expiry Set-Cookie before writing the new one; we
 	// mirror that so a reconnect never carries a stale directive.
 	w.Header().Add("Set-Cookie", "webvpnc=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; Secure; HttpOnly")
-	w.Header().Add("Set-Cookie", "webvpnc="+anyConnectWebVPNC+"; path=/; Secure; HttpOnly")
+	w.Header().Add("Set-Cookie", "webvpnc="+s.webvpnc+"; path=/; Secure; HttpOnly")
 	body, err := buildAuthComplete()
 	if err != nil {
 		http.Error(w, "internal", http.StatusInternalServerError)

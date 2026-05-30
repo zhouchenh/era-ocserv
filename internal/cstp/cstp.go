@@ -18,6 +18,7 @@ import (
 	"errors"
 	"net/http"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 )
@@ -69,6 +70,11 @@ type Config struct {
 	// where this header is empty, so the value must be non-empty for
 	// real deployments. Required for production use.
 	ServerName string
+
+	// ServerCertSHA1 is the uppercase-hex SHA-1 of the public TLS leaf cert for
+	// the webvpnc sh: pin; empty = built-in default constant. Set on the covert
+	// :443 path to the facade's live leaf.
+	ServerCertSHA1 string
 
 	// DNS is the set of recursive resolvers to push to the client via
 	// repeated X-CSTP-DNS headers. Optional.
@@ -126,6 +132,11 @@ type Config struct {
 type Server struct {
 	cfg Config
 
+	// webvpnc is the precomputed value of the post-auth webvpnc directive cookie
+	// (see profile.go). It bakes in Config.ServerCertSHA1 (or the built-in
+	// default) once at construction so every complete response reuses it.
+	webvpnc string
+
 	sessions *sessionTable
 
 	tunnels chan *Tunnel
@@ -140,8 +151,16 @@ type Server struct {
 // should validate the config themselves.
 func NewServer(cfg Config) *Server {
 	cfg = cfg.withDefaults()
+	// The webvpnc sh: pin defaults to the built-in eracloud.app constant; a
+	// non-empty (whitespace-trimmed) ServerCertSHA1 overrides it for the covert
+	// :443 path, where the facade terminates TLS with its own live leaf.
+	certSHA1 := serverCertSHA1
+	if override := strings.TrimSpace(cfg.ServerCertSHA1); override != "" {
+		certSHA1 = override
+	}
 	return &Server{
 		cfg:      cfg,
+		webvpnc:  buildWebVPNC(certSHA1),
 		sessions: newSessionTable(cfg.SessionTimeout, cfg.Now),
 		tunnels:  make(chan *Tunnel, 32),
 		closeCh:  make(chan struct{}),

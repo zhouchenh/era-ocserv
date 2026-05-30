@@ -43,17 +43,23 @@ const anyConnectProfileXML = `<?xml version="1.0" encoding="UTF-8"?>
 
 // serverCertSHA1 is the uppercase-hex SHA-1 of the eracloud.app public TLS leaf
 // certificate (the facade terminates TLS, so era-ocserv cannot read it). It
-// populates the webvpnc directive's sh: field — AnyConnect's gateway-cert pin.
-// NOTE: if the public cert rotates this must be updated; a future change should
-// have the facade pass its leaf-cert hash to era-ocserv via a handoff TLV.
+// populates the webvpnc directive's sh: field — AnyConnect's gateway-cert pin —
+// as the built-in DEFAULT when no override is configured.
+// NOTE: on the covert :443 path the facade terminates TLS with its own live
+// eracloud.app leaf, which this constant may not match; the -server-cert-sha1
+// flag (cstp.Config.ServerCertSHA1) overrides it per deployment. A future change
+// should instead have the facade pass its leaf-cert hash to era-ocserv via a
+// handoff TLV (the ERA TLV range 0xE0-0xEF is fully allocated, so that is a
+// separate documented follow-up).
 const serverCertSHA1 = "525FB9D7A730F41527C4F85394454E716B389997"
 
-// anyConnectWebVPNC is the value of the `webvpnc` directive cookie stock ocserv
+// buildWebVPNC builds the value of the `webvpnc` directive cookie stock ocserv
 // sets on the type="complete" response (worker-auth.c). Cisco Secure Client
 // reads it AFTER auth to learn what to do before the tunnel CONNECT:
 //
 //	bu: base URL · p:t protocol=tunnel · iu: install URL · sh: gateway cert hash
 //
+// certSHA1 is the uppercase-hex SHA-1 of the public TLS leaf cert (the sh: pin).
 // This is EXACTLY stock ocserv's directive when no client profile is configured
 // — and a side-by-side capture against the iOS Cisco Secure Client proved that
 // shape connects instantly. The optional `lu:` (translation-table URL) and
@@ -64,7 +70,9 @@ const serverCertSHA1 = "525FB9D7A730F41527C4F85394454E716B389997"
 // the CONNECT. Stock ships none of them and works; we match stock. The value is
 // sent verbatim (its &/:/% are literal — do NOT use http.SetCookie, which would
 // percent-escape them).
-var anyConnectWebVPNC = "bu:/&p:t&iu:1/&sh:" + serverCertSHA1
+func buildWebVPNC(certSHA1 string) string {
+	return "bu:/&p:t&iu:1/&sh:" + certSHA1
+}
 
 // AnyConnect post-auth "housekeeping" response bodies the client GETs between
 // auth and the tunnel CONNECT (the webvpnc lu:/iu: targets + the VPN downloader
