@@ -139,9 +139,19 @@ func extractWebVPNCookie(r *http.Request) string {
 	return ""
 }
 
+// clatInnerMTUCap is the upper bound on the advertised inner MTU. It is the
+// IPv6 outbound MTU (1420) minus the 20-byte SIIT46 v4->v6 header growth, so
+// a 1400-byte inner v4 packet (CLAT path) translates to a 1420-byte v6 packet
+// that still fits the external 464PLAT egress without fragmentation. It is
+// equally safe for the native v6 inner path (1400 <= 1420). The client's
+// X-CSTP-Base-MTU stays 1500.
+const clatInnerMTUCap = 1400
+
 // negotiateInnerMTU computes the inner-frame MTU from the client's
 // declared base + preferred MTUs per spec §1.7, capped at the per-
-// device configured MTU. Missing headers fall back to defaults.
+// device configured MTU and at clatInnerMTUCap (so neither the v4 CLAT nor
+// the native v6 inner path fragments post-translation). Missing headers fall
+// back to defaults.
 func negotiateInnerMTU(r *http.Request, deviceMTU int) int {
 	baseMTU := atoiDefault(r.Header.Get("X-CSTP-Base-MTU"), 1500)
 	want := atoiDefault(r.Header.Get("X-CSTP-MTU"), deviceMTU)
@@ -160,6 +170,11 @@ func negotiateInnerMTU(r *http.Request, deviceMTU int) int {
 	}
 	if deviceMTU > 0 && deviceMTU < result {
 		result = deviceMTU
+	}
+	// Cap at the SIIT-safe ceiling so a full-MTU inner v4 packet still fits
+	// the v6 egress after the 20-byte header growth.
+	if result > clatInnerMTUCap {
+		result = clatInnerMTUCap
 	}
 	if result < 576 {
 		result = 576
@@ -191,8 +206,10 @@ func emitCSTPHeaders(h http.Header, cfg Config, id Identity, innerMTU int) {
 	}
 
 	// CLAT placeholder per ADR 0035: every client receives the same
-	// 192.0.0.1/32 inner source and the upstream TAYGA NAT64 handles
-	// outbound v4 translation.
+	// 192.0.0.1/32 inner source. era-ocserv's stateless SIIT data plane
+	// (internal/clat + internal/clatxlat) translates this inner v4 to/from
+	// 64:ff9b::<v4dst> sourced from the device's CLAT /128, which egresses
+	// through the existing external 464PLAT. CLAT-only: no NAT64/NAT44/TAYGA.
 	h.Set("X-CSTP-Address", "192.0.0.1")
 	h.Set("X-CSTP-Netmask", "255.255.255.255")
 

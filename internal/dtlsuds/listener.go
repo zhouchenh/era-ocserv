@@ -33,6 +33,19 @@ type PacketSink interface {
 	WritePacket(p []byte) (int, error)
 }
 
+// SessionPacketSink is an OPTIONAL richer PacketSink the listener prefers
+// when the supplied Sink implements it. It hands the originating *Session
+// alongside the packet so the bridge can apply per-session CLAT translation
+// (the client's inner-IPv4 → the device CLAT /128 SIIT source) before TUN
+// injection. A Sink that does not implement this interface keeps the plain
+// WritePacket behaviour (the native v6-only path is unchanged).
+type SessionPacketSink interface {
+	PacketSink
+	// WritePacketFromSession pushes one IP packet from a known session into
+	// the tun device. Same goroutine / non-panic contract as WritePacket.
+	WritePacketFromSession(s *Session, p []byte) (int, error)
+}
+
 // SessionLifecycle is the bridge-side hook surface the listener notifies
 // when sessions are admitted and evicted.
 //
@@ -120,6 +133,11 @@ type Listener struct {
 
 	socketPath     string
 	resolveTimeout time.Duration
+
+	// sessionSink is opts.Sink narrowed to SessionPacketSink, or nil when
+	// the supplied Sink only implements the plain PacketSink. Cached at
+	// construction so the hot data path avoids a per-packet type assertion.
+	sessionSink SessionPacketSink
 }
 
 // Listen binds the UDS socket, starts the session table eviction loop,
@@ -160,6 +178,9 @@ func Listen(ctx context.Context, opts Options) (*Listener, error) {
 		now:            now,
 		socketPath:     opts.SocketPath,
 		resolveTimeout: opts.ResolveTimeout,
+	}
+	if ss, ok := opts.Sink.(SessionPacketSink); ok {
+		l.sessionSink = ss
 	}
 	l.table = NewTable(TableOptions{
 		IdleTimeout:  opts.IdleTimeout,
@@ -275,6 +296,14 @@ func (l *Listener) handle(ctx context.Context, acc *udshandoff.AcceptedDatagram)
 	if !inner.IsValid() {
 		return fmt.Errorf("dtlsuds: resolver returned invalid IPv6 for %s", deviceID)
 	}
+	// The CLAT-source /128 is optional: a device without a second /128 (or a
+	// TPM that predates the field) leaves it zero, and the session runs
+	// v6-only. When present it is already validated as an in-pool /128 by
+	// the resolver.
+	var clatV6 netip.Addr
+	if ident.IPv6CLAT.IsValid() {
+		clatV6 = ident.IPv6CLAT.Addr()
+	}
 
 	// Capture the framework-supplied Reply closure for the session
 	// lifetime. The closure re-uses the first datagram's PROXY-v2
@@ -284,7 +313,7 @@ func (l *Listener) handle(ctx context.Context, acc *udshandoff.AcceptedDatagram)
 	now := l.now()
 
 	session, existed := l.table.LoadOrCreate(key, func() *Session {
-		return newSession(key, deviceID, userID, traceID, subjectDN, inner, psk, reply, now)
+		return newSession(key, deviceID, userID, traceID, subjectDN, inner, clatV6, psk, reply, now)
 	})
 	if existed {
 		// Lost the admission race; the other goroutine constructed the
@@ -326,13 +355,23 @@ func (l *Listener) forwardPacket(s *Session, acc *udshandoff.AcceptedDatagram) e
 		if len(body) == 0 {
 			return nil
 		}
-		if _, err := l.opts.Sink.WritePacket(body); err != nil {
+		// Prefer the session-aware sink so the bridge can apply per-session
+		// CLAT client->tun translation (inner v4 → device CLAT /128 SIIT
+		// source). When the sink is plain, fall back to a raw write — the
+		// native v6-only path is unchanged.
+		var writeErr error
+		if l.sessionSink != nil {
+			_, writeErr = l.sessionSink.WritePacketFromSession(s, body)
+		} else {
+			_, writeErr = l.opts.Sink.WritePacket(body)
+		}
+		if writeErr != nil {
 			l.logger.Debug("tun write failed",
 				slog.String("trace_id", s.traceID),
 				slog.String("device_id", s.deviceID),
-				slog.String("err", err.Error()),
+				slog.String("err", writeErr.Error()),
 			)
-			return err
+			return writeErr
 		}
 		return nil
 	case pktDPDOut:
