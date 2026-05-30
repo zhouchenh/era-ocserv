@@ -8,11 +8,21 @@
 # cannot be extended with `nft add element`. So we add two comment-tagged rules
 # for era-ocserv-tun and never touch the WG/CLAT rules. `iifname`/`oifname` match
 # by name, so the rules are valid even before the tun device exists.
+#
+# We clamp to a FIXED MSS, not `set rt mtu`. The WG path can use `rt mtu` because
+# its traffic routes via era-clat (a 1280-MTU iface). era-ocserv instead SIITs the
+# inner packet and routes it out eth0 (MTU 1500), so `rt mtu` would resolve to
+# 1500 and miss the real bottleneck: the AnyConnect client is reached over
+# DTLS-in-UDP-in-IPv6 (the covert :443 path), whose encapsulation (~98 B) plus the
+# SIIT +20 must fit the ~1500 outer MTU. MSS 1280 -> max ~1300 B inner v4 ->
+# ~1398 B outer: safe headroom on any path >= the IPv6 minimum. Without this, the
+# TCP handshake completes but the first full-size data segment blackholes.
 set -eu
 
 TABLE="inet era_nat64"
 CHAIN="forward"
 TAG="era-ocserv-clat"
+MSS="1280"
 
 if ! nft list table $TABLE >/dev/null 2>&1; then
   echo "era-ocserv-mss-clamp: table '$TABLE' absent (WG/CLAT deploy owns it); skipping" >&2
@@ -25,6 +35,6 @@ nft -a list chain $TABLE $CHAIN 2>/dev/null \
   | grep -oE 'handle [0-9]+' | awk '{print $2}' \
   | while read -r h; do nft delete rule $TABLE $CHAIN handle "$h"; done
 
-nft add rule $TABLE $CHAIN iifname "era-ocserv-tun" tcp flags syn tcp option maxseg size set rt mtu comment "$TAG"
-nft add rule $TABLE $CHAIN oifname "era-ocserv-tun" tcp flags syn tcp option maxseg size set rt mtu comment "$TAG"
+nft add rule $TABLE $CHAIN iifname "era-ocserv-tun" tcp flags syn tcp option maxseg size set $MSS comment "$TAG"
+nft add rule $TABLE $CHAIN oifname "era-ocserv-tun" tcp flags syn tcp option maxseg size set $MSS comment "$TAG"
 echo "era-ocserv-mss-clamp: era-ocserv-tun MSS clamp ensured"
