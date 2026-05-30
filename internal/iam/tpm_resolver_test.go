@@ -34,6 +34,7 @@ type fakeClientConfig struct {
 	ClientPublicKey  string `json:"client_public_key"`
 	SourceIPv6Native string `json:"source_ipv6_native,omitempty"`
 	SourceIPv6CLAT   string `json:"source_ipv6_clat,omitempty"`
+	SourceIPv6Ocserv string `json:"source_ipv6_ocserv,omitempty"`
 	// other fields elided
 }
 
@@ -100,6 +101,31 @@ func TestTPMResolverHappyPath(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&requests); got != 1 {
 		t.Errorf("upstream requests = %d, want 1", got)
+	}
+}
+
+func TestTPMResolverPrefersOcservAddress(t *testing.T) {
+	// A device that coexists WG + AnyConnect carries BOTH a native (WG) /128
+	// and an ocserv /128. The resolver must use the ocserv /128 (kind
+	// ocserv_ipv6, routed to era-ocserv-tun) so AnyConnect return traffic does
+	// not egress via era-wg (DEC-anyconnect-own-128).
+	r, _ := newTestResolver(t, func(w http.ResponseWriter, req *http.Request) {
+		assertAuth(t, req)
+		writeFakeConfig(t, w, fakeClientConfig{
+			SchemaVersion:    2,
+			DeviceID:         testDeviceID,
+			SourceIPv6Native: "2001:470:f9d1:9001:dead:beef::1/128",
+			SourceIPv6Ocserv: "2001:470:f9d1:9001:0c5e:7777::9/128",
+		})
+	}, nil)
+
+	id, err := r.Resolve(context.Background(), testDeviceID)
+	if err != nil {
+		t.Fatalf("Resolve err = %v", err)
+	}
+	want := netip.MustParsePrefix("2001:470:f9d1:9001:0c5e:7777::9/128")
+	if id.IPv6 != want {
+		t.Errorf("IPv6 = %v, want ocserv /128 %v", id.IPv6, want)
 	}
 }
 

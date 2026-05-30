@@ -243,31 +243,40 @@ func (r *TPMResolver) fetch(ctx context.Context, deviceID string) (Identity, err
 	var raw struct {
 		DeviceID         string `json:"device_id"`
 		SourceIPv6Native string `json:"source_ipv6_native"`
+		SourceIPv6Ocserv string `json:"source_ipv6_ocserv"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return Identity{}, fmt.Errorf("%w: decode client-config: %v", ErrUpstream, err)
 	}
 
-	prefix := strings.TrimSpace(raw.SourceIPv6Native)
+	// Per DEC-anyconnect-own-128 the AnyConnect device has its OWN /128
+	// (kind ocserv_ipv6), advertised as source_ipv6_ocserv and routed to
+	// era-ocserv-tun. Prefer it; fall back to source_ipv6_native for
+	// compatibility with a TPM that predates the ocserv field (and during
+	// rollout, before tpm+reconciler ship the ocserv pass).
+	prefix := strings.TrimSpace(raw.SourceIPv6Ocserv)
+	field := "source_ipv6_ocserv"
 	if prefix == "" {
-		// TPM knows the device but no native /128 has been allocated:
-		// no provisioned WG/oc tunnel. ADR 0057 5 — the AnyConnect
-		// transport shares the era-wg pool, so a device without a
-		// /128 cannot connect via either.
+		prefix = strings.TrimSpace(raw.SourceIPv6Native)
+		field = "source_ipv6_native"
+	}
+	if prefix == "" {
+		// TPM knows the device but no /128 has been allocated: no
+		// provisioned tunnel for this device.
 		return Identity{}, ErrNoTunnel
 	}
 	p, perr := netip.ParsePrefix(prefix)
 	if perr != nil {
-		return Identity{}, fmt.Errorf("%w: source_ipv6_native is not a valid prefix (%q): %v", ErrUpstream, prefix, perr)
+		return Identity{}, fmt.Errorf("%w: %s is not a valid prefix (%q): %v", ErrUpstream, field, prefix, perr)
 	}
 	if !p.Addr().Is6() {
-		return Identity{}, fmt.Errorf("%w: source_ipv6_native is not IPv6 (%q)", ErrUpstream, prefix)
+		return Identity{}, fmt.Errorf("%w: %s is not IPv6 (%q)", ErrUpstream, field, prefix)
 	}
 	if p.Bits() != 128 {
-		return Identity{}, fmt.Errorf("%w: source_ipv6_native is not a /128 (%q)", ErrUpstream, prefix)
+		return Identity{}, fmt.Errorf("%w: %s is not a /128 (%q)", ErrUpstream, field, prefix)
 	}
 	if !r.pool.Contains(p.Addr()) {
-		return Identity{}, fmt.Errorf("%w: source_ipv6_native %s is outside pool %s", ErrUpstream, p, r.pool)
+		return Identity{}, fmt.Errorf("%w: %s %s is outside pool %s", ErrUpstream, field, p, r.pool)
 	}
 
 	id := Identity{
