@@ -50,6 +50,12 @@ type Session struct {
 	// the iam.Resolver). The address inside is the tunnel-inner source IP
 	// the client uses on its TUN packets. Read-only.
 	inner netip.Addr
+	// clatV6 is the device's CLAT-source /128 (kind ocserv_clat_ipv6),
+	// resolved from deviceID. When valid, the bridge builds a per-session
+	// SIIT translator from it and also registers this session under this
+	// /128 so 64:ff9b:: replies route back. An invalid (zero) value means
+	// CLAT is disabled for this session (v6-only). Read-only.
+	clatV6 netip.Addr
 	// psk is the 32-byte DTLS pre-shared key the facade derived during CSTP
 	// auth and forwarded via ERA_TLV_DTLS_PSK on the FIRST datagram. We
 	// cache it purely for audit / future debug; era-facade owns DTLS
@@ -76,12 +82,13 @@ type replyFunc func(payload []byte) error
 
 // newSession constructs a Session from the metadata gathered out of a
 // validated first-datagram. The lastSeen timestamp is initialised to now.
-func newSession(key FourTuple, deviceID, userID, traceID, subjectDN string, inner netip.Addr, psk [32]byte, reply func([]byte) error, now time.Time) *Session {
+func newSession(key FourTuple, deviceID, userID, traceID, subjectDN string, inner, clatV6 netip.Addr, psk [32]byte, reply func([]byte) error, now time.Time) *Session {
 	s := &Session{
 		key:       key,
 		deviceID:  deviceID,
 		userID:    userID,
 		inner:     inner,
+		clatV6:    clatV6,
 		psk:       psk,
 		subjectDN: subjectDN,
 		traceID:   traceID,
@@ -107,6 +114,11 @@ func (s *Session) UserID() string { return s.userID }
 // InnerIPv6 returns the device's assigned /128 (used by the TUN bridge to
 // route outbound packets toward this session).
 func (s *Session) InnerIPv6() netip.Addr { return s.inner }
+
+// ClatV6 returns the device's CLAT-source /128, or the zero Addr when CLAT is
+// disabled for this session. The bridge uses it to build the per-session SIIT
+// translator and to register the session under the CLAT /128 key.
+func (s *Session) ClatV6() netip.Addr { return s.clatV6 }
 
 // TraceID returns the facade-assigned correlation id.
 func (s *Session) TraceID() string { return s.traceID }

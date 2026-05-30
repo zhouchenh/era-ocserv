@@ -17,6 +17,15 @@ type Identity struct {
 	// IPv6 is the assigned /128. The prefix length is always 128; the
 	// address is always inside the configured pool.
 	IPv6 netip.Prefix
+	// IPv6CLAT is the device's SECOND /128 (kind ocserv_clat_ipv6),
+	// advertised by TPM as source_ipv6_ocserv_clat. It is the source
+	// address era-ocserv's stateless SIIT engine uses for the client's
+	// inner-IPv4 (CLAT) traffic: the placeholder 192.0.0.1 is translated to
+	// 64:ff9b::<v4dst> sourced from this /128. An invalid (zero) value means
+	// the device has no CLAT /128 — CLAT is disabled and the session runs
+	// v6-only, exactly as before. When valid the prefix length is always
+	// 128 and the address is inside the configured pool.
+	IPv6CLAT netip.Prefix
 	// MTU is an optional per-device MTU override. Zero means default.
 	MTU int
 	// DNS is an optional override of the DNS resolvers to push as

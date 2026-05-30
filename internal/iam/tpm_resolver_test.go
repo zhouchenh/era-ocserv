@@ -25,16 +25,17 @@ const (
 // We mirror the field names exactly so the resolver's decode path is
 // genuinely exercised.
 type fakeClientConfig struct {
-	SchemaVersion    int    `json:"schema_version"`
-	DeviceID         string `json:"device_id"`
-	UserID           string `json:"user_id"`
-	Username         string `json:"username"`
-	DeviceName       string `json:"device_name"`
-	PeerID           string `json:"peer_id"`
-	ClientPublicKey  string `json:"client_public_key"`
-	SourceIPv6Native string `json:"source_ipv6_native,omitempty"`
-	SourceIPv6CLAT   string `json:"source_ipv6_clat,omitempty"`
-	SourceIPv6Ocserv string `json:"source_ipv6_ocserv,omitempty"`
+	SchemaVersion        int    `json:"schema_version"`
+	DeviceID             string `json:"device_id"`
+	UserID               string `json:"user_id"`
+	Username             string `json:"username"`
+	DeviceName           string `json:"device_name"`
+	PeerID               string `json:"peer_id"`
+	ClientPublicKey      string `json:"client_public_key"`
+	SourceIPv6Native     string `json:"source_ipv6_native,omitempty"`
+	SourceIPv6CLAT       string `json:"source_ipv6_clat,omitempty"`
+	SourceIPv6Ocserv     string `json:"source_ipv6_ocserv,omitempty"`
+	SourceIPv6OcservClat string `json:"source_ipv6_ocserv_clat,omitempty"`
 	// other fields elided
 }
 
@@ -126,6 +127,79 @@ func TestTPMResolverPrefersOcservAddress(t *testing.T) {
 	want := netip.MustParsePrefix("2001:470:f9d1:9001:0c5e:7777::9/128")
 	if id.IPv6 != want {
 		t.Errorf("IPv6 = %v, want ocserv /128 %v", id.IPv6, want)
+	}
+}
+
+func TestTPMResolverDecodesOcservCLAT(t *testing.T) {
+	// A CLAT-enabled AnyConnect device carries a SECOND ocserv /128
+	// (source_ipv6_ocserv_clat). The resolver decodes it into IPv6CLAT while
+	// the native ocserv /128 stays in IPv6.
+	r, _ := newTestResolver(t, func(w http.ResponseWriter, req *http.Request) {
+		assertAuth(t, req)
+		writeFakeConfig(t, w, fakeClientConfig{
+			SchemaVersion:        2,
+			DeviceID:             testDeviceID,
+			SourceIPv6Ocserv:     "2001:470:f9d1:9001:0c5e:7777::9/128",
+			SourceIPv6OcservClat: "2001:470:f9d1:9001:c1a7::1/128",
+		})
+	}, nil)
+
+	id, err := r.Resolve(context.Background(), testDeviceID)
+	if err != nil {
+		t.Fatalf("Resolve err = %v", err)
+	}
+	if want := netip.MustParsePrefix("2001:470:f9d1:9001:0c5e:7777::9/128"); id.IPv6 != want {
+		t.Errorf("IPv6 = %v, want native ocserv /128 %v", id.IPv6, want)
+	}
+	if want := netip.MustParsePrefix("2001:470:f9d1:9001:c1a7::1/128"); id.IPv6CLAT != want {
+		t.Errorf("IPv6CLAT = %v, want CLAT /128 %v", id.IPv6CLAT, want)
+	}
+}
+
+func TestTPMResolverToleratesAbsentCLAT(t *testing.T) {
+	// CLAT disabled: no source_ipv6_ocserv_clat. The native /128 resolves and
+	// IPv6CLAT stays zero (the session runs v6-only).
+	r, _ := newTestResolver(t, func(w http.ResponseWriter, req *http.Request) {
+		assertAuth(t, req)
+		writeFakeConfig(t, w, fakeClientConfig{
+			SchemaVersion:    2,
+			DeviceID:         testDeviceID,
+			SourceIPv6Ocserv: "2001:470:f9d1:9001:0c5e:7777::9/128",
+		})
+	}, nil)
+
+	id, err := r.Resolve(context.Background(), testDeviceID)
+	if err != nil {
+		t.Fatalf("Resolve err = %v", err)
+	}
+	if id.IPv6CLAT.IsValid() {
+		t.Errorf("IPv6CLAT = %v, want zero (CLAT disabled)", id.IPv6CLAT)
+	}
+}
+
+func TestTPMResolverRejectsBadCLAT(t *testing.T) {
+	// A present-but-malformed / out-of-pool CLAT /128 is an error, mirroring
+	// the native /128 validation. A /64 CLAT prefix is not a /128.
+	cases := map[string]string{
+		"not-a-128":   "2001:470:f9d1:9001:c1a7::/64",
+		"out-of-pool": "2001:db8::1/128",
+		"not-ipv6":    "192.0.2.1/32",
+		"unparseable": "garbage",
+	}
+	for name, clat := range cases {
+		t.Run(name, func(t *testing.T) {
+			r, _ := newTestResolver(t, func(w http.ResponseWriter, req *http.Request) {
+				writeFakeConfig(t, w, fakeClientConfig{
+					SchemaVersion:        2,
+					DeviceID:             testDeviceID,
+					SourceIPv6Ocserv:     "2001:470:f9d1:9001:0c5e:7777::9/128",
+					SourceIPv6OcservClat: clat,
+				})
+			}, nil)
+			if _, err := r.Resolve(context.Background(), testDeviceID); !errors.Is(err, ErrUpstream) {
+				t.Fatalf("err = %v, want ErrUpstream for CLAT %q", err, clat)
+			}
+		})
 	}
 }
 

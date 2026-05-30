@@ -241,9 +241,10 @@ func (r *TPMResolver) fetch(ctx context.Context, deviceID string) (Identity, err
 	// We deliberately decode only the fields we need so an additive change
 	// upstream does not break us; UnknownFields are tolerated.
 	var raw struct {
-		DeviceID         string `json:"device_id"`
-		SourceIPv6Native string `json:"source_ipv6_native"`
-		SourceIPv6Ocserv string `json:"source_ipv6_ocserv"`
+		DeviceID             string `json:"device_id"`
+		SourceIPv6Native     string `json:"source_ipv6_native"`
+		SourceIPv6Ocserv     string `json:"source_ipv6_ocserv"`
+		SourceIPv6OcservClat string `json:"source_ipv6_ocserv_clat"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return Identity{}, fmt.Errorf("%w: decode client-config: %v", ErrUpstream, err)
@@ -265,25 +266,52 @@ func (r *TPMResolver) fetch(ctx context.Context, deviceID string) (Identity, err
 		// provisioned tunnel for this device.
 		return Identity{}, ErrNoTunnel
 	}
-	p, perr := netip.ParsePrefix(prefix)
+	p, perr := r.validatePoolHost128(field, prefix)
 	if perr != nil {
-		return Identity{}, fmt.Errorf("%w: %s is not a valid prefix (%q): %v", ErrUpstream, field, prefix, perr)
-	}
-	if !p.Addr().Is6() {
-		return Identity{}, fmt.Errorf("%w: %s is not IPv6 (%q)", ErrUpstream, field, prefix)
-	}
-	if p.Bits() != 128 {
-		return Identity{}, fmt.Errorf("%w: %s is not a /128 (%q)", ErrUpstream, field, prefix)
-	}
-	if !r.pool.Contains(p.Addr()) {
-		return Identity{}, fmt.Errorf("%w: %s %s is outside pool %s", ErrUpstream, field, p, r.pool)
+		return Identity{}, perr
 	}
 
 	id := Identity{
 		DeviceID: deviceIDOrFallback(raw.DeviceID, deviceID),
 		IPv6:     p,
 	}
+
+	// Decode the device's CLAT-source /128 (kind ocserv_clat_ipv6),
+	// advertised as source_ipv6_ocserv_clat. It is validated with the SAME
+	// /128 + IPv6 + in-pool rules as the native /128. An empty value means
+	// CLAT is disabled for this device (the session runs v6-only); only a
+	// PRESENT-but-malformed value is an error, so an additive TPM that does
+	// not yet emit the field, or a device without a second /128, both fall
+	// through cleanly.
+	if clatPrefix := strings.TrimSpace(raw.SourceIPv6OcservClat); clatPrefix != "" {
+		clatP, clatErr := r.validatePoolHost128("source_ipv6_ocserv_clat", clatPrefix)
+		if clatErr != nil {
+			return Identity{}, clatErr
+		}
+		id.IPv6CLAT = clatP
+	}
+
 	return id, nil
+}
+
+// validatePoolHost128 parses prefix and enforces the IPv6 + /128 + in-pool
+// invariants shared by the native and CLAT source addresses. field names the
+// JSON key in error messages.
+func (r *TPMResolver) validatePoolHost128(field, prefix string) (netip.Prefix, error) {
+	p, perr := netip.ParsePrefix(prefix)
+	if perr != nil {
+		return netip.Prefix{}, fmt.Errorf("%w: %s is not a valid prefix (%q): %v", ErrUpstream, field, prefix, perr)
+	}
+	if !p.Addr().Is6() {
+		return netip.Prefix{}, fmt.Errorf("%w: %s is not IPv6 (%q)", ErrUpstream, field, prefix)
+	}
+	if p.Bits() != 128 {
+		return netip.Prefix{}, fmt.Errorf("%w: %s is not a /128 (%q)", ErrUpstream, field, prefix)
+	}
+	if !r.pool.Contains(p.Addr()) {
+		return netip.Prefix{}, fmt.Errorf("%w: %s %s is outside pool %s", ErrUpstream, field, p, r.pool)
+	}
+	return p, nil
 }
 
 // endpointFor builds the TPM URL for a device. The deviceID is path-

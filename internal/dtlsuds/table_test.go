@@ -27,7 +27,7 @@ func makeSession(t *testing.T, key FourTuple, now time.Time) *Session {
 	return newSession(
 		key, "abcdef12-3456-7890-abcd-ef0123456789",
 		"user-1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "CN=device,OU=ERA",
-		inner, psk, func(b []byte) error { return nil }, now,
+		inner, netip.Addr{}, psk, func(b []byte) error { return nil }, now,
 	)
 }
 

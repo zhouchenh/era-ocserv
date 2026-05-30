@@ -278,7 +278,7 @@ func startDTLSListener(ctx context.Context, cfg config, br *bridge, resolver iam
 	l, err := dtlsuds.Listen(ctx, dtlsuds.Options{
 		SocketPath: cfg.dtlsUDSSocket,
 		Resolver:   resolver,
-		Sink:       newTunSink(dev),
+		Sink:       newTunSink(br, dev),
 		Lifecycle:  br,
 		Logger:     dtlsLogger,
 		Metrics:    metrics,
@@ -474,6 +474,7 @@ func (r resolverAdapter) Resolve(ctx context.Context, deviceID string) (cstp.Ide
 	return cstp.Identity{
 		DeviceID: id.DeviceID,
 		IPv6:     id.IPv6,
+		IPv6CLAT: id.IPv6CLAT,
 		MTU:      id.MTU,
 	}, nil
 }

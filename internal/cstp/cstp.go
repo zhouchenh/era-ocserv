@@ -49,6 +49,14 @@ type Identity struct {
 	// IPv6 is the /128 prefix assigned to this device. The address
 	// inside is the inner source IP the client uses on the tunnel.
 	IPv6 netip.Prefix
+	// IPv6CLAT is the device's CLAT-source /128 (kind ocserv_clat_ipv6).
+	// When valid, the bridge builds a per-session SIIT translator from it so
+	// the client's inner-IPv4 (placeholder 192.0.0.1) egresses as
+	// 64:ff9b::<v4dst> sourced from this address; the same *activeClient is
+	// also registered under this /128 so 64:ff9b:: replies route back. An
+	// invalid (zero) value means CLAT is disabled and the session runs
+	// v6-only. The address, when valid, is a /128 inside the pool.
+	IPv6CLAT netip.Prefix
 	// MTU is the inner-frame MTU advertised via X-CSTP-MTU. If zero the
 	// server falls back to Config.DefaultMTU.
 	MTU int
