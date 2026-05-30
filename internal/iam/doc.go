@@ -9,7 +9,7 @@
 //   - any AnyConnect wire-protocol concerns (internal/cstp)
 //
 // The TPMResolver is backed by TPM's authenticated provisioning HTTP API
-// (ADR 0054) and reads the per-device client-config to extract the native
+// (ADR 0054) and reads the per-device client-config to extract the assigned
 // IPv6 /128 (ADR 0035 / ADR 0036). Behavior contract:
 //
 //   - Endpoint: GET <BaseURL>/v1/provision/device/<deviceID>/client-config
@@ -17,11 +17,15 @@
 //     ADR 0054). The token is never logged.
 //   - The returned /128 MUST fall inside 2001:470:f9d1:9001::/64; anything
 //     else is rejected with ErrUpstream. The allowlist is configurable.
-//   - The TPM endpoint shape is the field returned by
-//     provisioning.ClientConfig.SourceIPv6Native ("source_ipv6_native" in
-//     JSON), parsed as a netip.Prefix. The allocation model (one /128 per
-//     device, single-transport binding) is set by the tpm provisioning
-//     orchestrator; this package only READS the binding.
+//   - The client-config advertises two source fields:
+//     provisioning.ClientConfig.SourceIPv6Ocserv ("source_ipv6_ocserv",
+//     PREFERRED — the AnyConnect device's OWN /128, kind ocserv_ipv6, routed
+//     to era-ocserv-tun per DEC-anyconnect-own-128) and SourceIPv6Native
+//     ("source_ipv6_native", FALLBACK for a TPM that predates the ocserv
+//     field). The resolver prefers ocserv and falls back to native, parsing
+//     the result as a netip.Prefix. Per DEC-anyconnect-own-128 an AnyConnect
+//     device gets its own /128 and may coexist with a WireGuard binding; this
+//     package only READS the binding.
 //
 // Subject to revision: the endpoint path or response shape may evolve when
 // the era-ocserv tpmctl subcommands land (a separate agent's work). If a
