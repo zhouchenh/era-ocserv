@@ -86,6 +86,23 @@ func TestHTTPVerifier_Success(t *testing.T) {
 	}
 }
 
+func TestHTTPVerifier_TrimsServiceTokenTransportBytes(t *testing.T) {
+	var sawAuth string
+	_, v := newTestVerifier(t, func(w http.ResponseWriter, r *http.Request) {
+		sawAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(verifyResponse{DeviceID: validDeviceIDSample})
+	})
+	v.serviceToken = "\ufefftest-service-token\r\n"
+
+	if _, err := v.Verify(context.Background(), "alice", "hunter2"); err != nil {
+		t.Fatalf("Verify: unexpected error: %v", err)
+	}
+	if sawAuth != "Bearer test-service-token" {
+		t.Fatalf("Authorization = %q, want trimmed bearer token", sawAuth)
+	}
+}
+
 func TestHTTPVerifier_PreservesBasePath(t *testing.T) {
 	// BaseURL with a path prefix should be honoured by the resolved
 	// endpoint. Some era-portal deployments could mount the API under

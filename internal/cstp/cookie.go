@@ -106,6 +106,22 @@ func (t *sessionTable) promote(opaqueID, username, deviceID string, randRead fun
 	return s, nil
 }
 
+// stashUsername records the username on a pre-auth session between the two
+// rounds of the 2-step (username-then-password) auth flow. It does NOT
+// authenticate or mint a token — that happens in promote after the password is
+// verified. Returns false if the opaque row is gone/expired. Passing an empty
+// username clears the stash (used to restart the flow at the username prompt).
+func (t *sessionTable) stashUsername(opaqueID, username string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s, ok := t.byOpaque[opaqueID]
+	if !ok || t.now().After(s.expiresAt) {
+		return false
+	}
+	s.username = username
+	return true
+}
+
 // lookupOpaque returns the pre-auth session for a given opaque id, or
 // nil if it has expired or never existed. Expired rows are reaped
 // inline.

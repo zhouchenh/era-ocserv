@@ -1,12 +1,14 @@
 package cstp
 
 import (
+	"bufio"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
 	"strconv"
@@ -58,8 +60,9 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		if binding, ok := s.cfg.DTLSBindingSource(r, id); ok {
 			if secret, err := issueDTLSSecret(s.cfg.RandRead); err == nil {
 				binding.PSK = secret
+				address := dtlsAddressForRequest(r, s.cfg)
 				if err := s.cfg.DTLSBindingInstaller.Upsert(r.Context(), binding); err == nil {
-					emitDTLSHeaders(headers, secret[:], innerMTU)
+					emitDTLSHeaders(headers, secret[:], innerMTU, address)
 					tunnelDTLS = &dtlsBindingState{
 						installer:       s.cfg.DTLSBindingInstaller,
 						binding:         binding,
@@ -75,7 +78,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		// DTLS when the outer connection exposes RFC 5705 exporter material.
 		dtlsSecret, dtlsOK := deriveDTLSSecret(r)
 		if dtlsOK {
-			emitDTLSHeaders(headers, dtlsSecret, innerMTU)
+			emitDTLSHeaders(headers, dtlsSecret, innerMTU, dtlsAddressForRequest(r, s.cfg))
 		}
 	}
 
@@ -200,10 +203,25 @@ func emitCSTPHeaders(h http.Header, cfg Config, id Identity, innerMTU int) {
 		h.Set("X-CSTP-Default-Domain", cfg.DefaultDomain)
 	}
 	for _, dns := range cfg.DNS {
-		h.Add("X-CSTP-DNS", dns.String())
+		// Cisco Secure Client (AnyConnect) requires IPv6 DNS servers in
+		// X-CSTP-DNS-IP6; an IPv6 literal placed in plain X-CSTP-DNS is parsed as
+		// IPv4, fails validation, and makes the iOS client reject the WHOLE tunnel
+		// config ("The VPN configuration received from the secure gateway is
+		// invalid"). Stock ocserv branches exactly this way for AnyConnect agents
+		// (worker-vpn.c: ip6 ? "DNS-IP6" : "DNS"). OpenConnect accepts either.
+		if dns.Is4() {
+			h.Add("X-CSTP-DNS", dns.String())
+		} else {
+			h.Add("X-CSTP-DNS-IP6", dns.String())
+		}
 	}
 	for _, sp := range cfg.SplitInclude {
-		h.Add("X-CSTP-Split-Include", sp.String())
+		// Same IPv4/IPv6 split as DNS: IPv6 routes go in the -IP6 variant.
+		if sp.Addr().Is4() {
+			h.Add("X-CSTP-Split-Include", sp.String())
+		} else {
+			h.Add("X-CSTP-Split-Include-IP6", sp.String())
+		}
 	}
 
 	h.Set("X-CSTP-DPD", strconv.Itoa(cfg.DPDInterval))
@@ -231,9 +249,12 @@ func emitCSTPHeaders(h http.Header, cfg Config, id Identity, innerMTU int) {
 // UDP handshake. The exporter-derived 32-byte secret is hex-encoded
 // per legacy convention (Cisco Secure Client accepts both hex and
 // base64; we pick hex to match openconnect / ocserv).
-func emitDTLSHeaders(h http.Header, secret []byte, innerMTU int) {
+func emitDTLSHeaders(h http.Header, secret []byte, innerMTU int, address string) {
 	h.Set("X-DTLS-Master-Secret", strings.ToUpper(hex.EncodeToString(secret)))
 	h.Set("X-DTLS-CipherSuite", "PSK-NEGOTIATE")
+	if address != "" {
+		h.Set("X-DTLS-Address", address)
+	}
 	h.Set("X-DTLS-Port", "443")
 	h.Set("X-DTLS-Rekey-Time", "28800")
 	h.Set("X-DTLS-Rekey-Method", "ssl")
@@ -252,6 +273,19 @@ func emitDTLSHeaders(h http.Header, secret []byte, innerMTU int) {
 	if sid, err := randHex(nil, 32); err == nil {
 		h.Set("X-DTLS-Session-ID", sid)
 	}
+}
+
+func dtlsAddressForRequest(r *http.Request, cfg Config) string {
+	if r != nil {
+		host := strings.TrimSpace(r.Host)
+		if host != "" {
+			if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+				return parsedHost
+			}
+			return host
+		}
+	}
+	return strings.TrimSpace(cfg.ServerName)
 }
 
 // deriveDTLSSecret pulls a 32-byte PSK from the outer TLS session
@@ -299,23 +333,72 @@ func writeConnectResponse(rw io.Writer, h http.Header) error {
 			for _, v := range vs {
 				fmt.Fprintf(&sb, "%s: %s\r\n", k, v)
 			}
-			emitted[k] = true
+			// Mark as emitted under the CANONICAL key, because the range below
+			// iterates the map whose keys are canonicalised (e.g. "X-Cstp-Version").
+			// Without this the well-known headers are emitted a SECOND time in
+			// Go's casing, producing duplicate X-CSTP-* headers in two casings —
+			// which a strict client can choke on.
+			emitted[http.CanonicalHeaderKey(k)] = true
 		}
 	}
 	for k, vs := range h {
 		if emitted[k] {
 			continue
 		}
+		wireKey := connectWireHeaderKey(k)
 		for _, v := range vs {
-			fmt.Fprintf(&sb, "%s: %s\r\n", k, v)
+			fmt.Fprintf(&sb, "%s: %s\r\n", wireKey, v)
 		}
 	}
 	sb.WriteString("\r\n")
 	_, err := io.WriteString(rw, sb.String())
-	if bw, ok := rw.(interface{ Flush() error }); ok {
+	if bw, ok := rw.(*bufio.ReadWriter); ok {
+		_ = bw.Flush()
+	} else if bw, ok := rw.(interface{ Flush() error }); ok {
 		_ = bw.Flush()
 	}
 	return err
+}
+
+func connectWireHeaderKey(k string) string {
+	switch k {
+	case "X-Dtls-Address":
+		return "X-DTLS-Address"
+	case "X-Dtls-Port":
+		return "X-DTLS-Port"
+	case "X-Dtls-Ciphersuite":
+		return "X-DTLS-CipherSuite"
+	case "X-Dtls12-Ciphersuite":
+		return "X-DTLS12-CipherSuite"
+	case "X-Dtls-Master-Secret":
+		return "X-DTLS-Master-Secret"
+	case "X-Dtls-Session-Id":
+		return "X-DTLS-Session-ID"
+	case "X-Dtls-App-Id":
+		return "X-DTLS-App-ID"
+	case "X-Dtls-Rekey-Time":
+		return "X-DTLS-Rekey-Time"
+	case "X-Dtls-Rekey-Method":
+		return "X-DTLS-Rekey-Method"
+	case "X-Dtls-Keepalive":
+		return "X-DTLS-Keepalive"
+	case "X-Dtls-Dpd":
+		return "X-DTLS-DPD"
+	case "X-Dtls-Mtu":
+		return "X-DTLS-MTU"
+	case "X-Cstp-Server-Cert-Hash":
+		return "X-CSTP-Server-Cert-Hash"
+	case "X-Cstp-Dns":
+		return "X-CSTP-DNS"
+	case "X-Cstp-Dns-Ip6":
+		return "X-CSTP-DNS-IP6"
+	case "X-Cstp-Split-Include":
+		return "X-CSTP-Split-Include"
+	case "X-Cstp-Split-Include-Ip6":
+		return "X-CSTP-Split-Include-IP6"
+	default:
+		return k
+	}
 }
 
 // serverCertHashBase64 is exposed for callers that want to compute the

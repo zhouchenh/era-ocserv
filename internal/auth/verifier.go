@@ -98,13 +98,18 @@ type verifyResponse struct {
 	DeviceID string `json:"device_id"`
 }
 
+func normalizeServiceToken(s string) string {
+	return strings.TrimSpace(strings.TrimPrefix(s, "\ufeff"))
+}
+
 // Verify posts username + password to the era-portal auth-verify
 // endpoint and returns the device UUID on success.
 func (h *HTTPVerifier) Verify(ctx context.Context, username, password string) (string, error) {
 	if h == nil || h.endpoint == nil {
 		return "", fmt.Errorf("%w: verifier not configured", ErrUpstream)
 	}
-	if h.serviceToken == "" {
+	token := normalizeServiceToken(h.serviceToken)
+	if token == "" {
 		return "", fmt.Errorf("%w: service token not configured", ErrUpstream)
 	}
 
@@ -121,7 +126,7 @@ func (h *HTTPVerifier) Verify(ctx context.Context, username, password string) (s
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+h.serviceToken)
+	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {

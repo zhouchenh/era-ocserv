@@ -98,6 +98,17 @@ func newAuthReplyBody(opaqueID, user, pass string) string {
 </config-auth>`, opaqueID, user, pass)
 }
 
+// newAuthReplyUsername / newAuthReplyPassword are the two rounds of the 2-step
+// simple auth flow: the client submits the username (step 1), then the password
+// (step 2), each echoing the round-tripped opaque session id.
+func newAuthReplyUsername(opaqueID, user string) string {
+	return fmt.Sprintf(`<config-auth client="vpn" type="auth-reply"><opaque is-for="sg"><session-id>%s</session-id></opaque><auth><username>%s</username></auth></config-auth>`, opaqueID, user)
+}
+
+func newAuthReplyPassword(opaqueID, pass string) string {
+	return fmt.Sprintf(`<config-auth client="vpn" type="auth-reply"><opaque is-for="sg"><session-id>%s</session-id></opaque><auth><password>%s</password></auth></config-auth>`, opaqueID, pass)
+}
+
 // extractOpaqueID pulls the <session-id> value out of an auth-request
 // response body. The XML form is well-defined here so we don't need a
 // full XML parse.
@@ -144,21 +155,57 @@ func TestPhase2HappyPath(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("init status=%d", resp.StatusCode)
 	}
+	// Stock ocserv's simple auth path serves the auth-request as bare text/xml
+	// with NO X-Aggregate-Auth — the path the iOS Cisco Secure Client drives
+	// end-to-end. (A combined form + X-Aggregate-Auth put iOS on the aggregate
+	// path, which authenticated but then never sent the CONNECT.)
+	if ct := resp.Header.Get("Content-Type"); ct != "text/xml" {
+		t.Fatalf("auth-request Content-Type=%q, want exactly text/xml", ct)
+	}
+	if av := resp.Header.Get("X-Aggregate-Auth"); av != "" {
+		t.Fatalf("auth-request X-Aggregate-Auth=%q, want absent (simple path)", av)
+	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if !strings.Contains(string(body), `type="auth-request"`) {
 		t.Fatalf("expected auth-request, got: %s", body)
+	}
+	// Step-1 form is username-only (2-step simple path).
+	if !strings.Contains(string(body), `name="username"`) || strings.Contains(string(body), `name="password"`) {
+		t.Fatalf("step-1 form must be username-only: %s", body)
+	}
+	if strings.Contains(string(body), "aggregate-auth-version") {
+		t.Fatalf("server auth-request must NOT carry aggregate-auth-version (client-only attr): %s", body)
 	}
 	opaqueID := extractOpaqueID(string(body))
 	if opaqueID == "" {
 		t.Fatalf("missing opaque id in: %s", body)
 	}
 
-	// Phase 2b: auth-reply with correct creds.
+	// Phase 2b step 1: submit username -> server returns the password form.
 	resp, err = http.Post(ts.URL+"/auth", "application/xml",
-		strings.NewReader(newAuthReplyBody(opaqueID, "alice", "hunter2")))
+		strings.NewReader(newAuthReplyUsername(opaqueID, "alice")))
 	if err != nil {
-		t.Fatalf("auth POST: %v", err)
+		t.Fatalf("username POST: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("username step status=%d", resp.StatusCode)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `type="auth-request"`) || !strings.Contains(string(body), `name="password"`) {
+		t.Fatalf("expected password form after username step, got: %s", body)
+	}
+	opaqueID = extractOpaqueID(string(body))
+	if opaqueID == "" {
+		t.Fatalf("missing opaque id in password form: %s", body)
+	}
+
+	// Phase 2b step 2: submit password -> complete.
+	resp, err = http.Post(ts.URL+"/auth", "application/xml",
+		strings.NewReader(newAuthReplyPassword(opaqueID, "hunter2")))
+	if err != nil {
+		t.Fatalf("password POST: %v", err)
 	}
 	if resp.StatusCode != 200 {
 		t.Fatalf("auth status=%d", resp.StatusCode)
@@ -168,19 +215,99 @@ func TestPhase2HappyPath(t *testing.T) {
 	if !strings.Contains(string(body), `type="complete"`) {
 		t.Fatalf("expected complete, got: %s", body)
 	}
-	foundWebVPN := false
+	// The session credential is delivered via the Set-Cookie: webvpn header
+	// (the Cisco Secure Client path), not an XML element.
+	var token string
 	for _, c := range resp.Cookies() {
 		if c.Name == "webvpn" && c.Value != "" {
-			foundWebVPN = true
+			token = c.Value
 			break
 		}
 	}
-	if !foundWebVPN {
-		t.Fatalf("missing webvpn auth cookie")
-	}
-	token := extractSessionToken(string(body))
 	if token == "" {
-		t.Fatalf("missing session token in: %s", body)
+		t.Fatalf("missing webvpn auth cookie carrying the session token: %s", body)
+	}
+	// The post-auth directive cookie must be stock ocserv's minimal shape:
+	// bu/p/iu/sh only. fu:/fh: (profile fetch) and lu: (translation-table fetch)
+	// drove the iOS Cisco Secure Client into a pre-tunnel fetch it never
+	// completed, so it went silent after the complete and never sent the CONNECT.
+	// They must stay absent.
+	var directive string
+	for _, c := range resp.Cookies() {
+		if c.Name == "webvpnc" && c.Value != "" {
+			directive = c.Value
+		}
+	}
+	if directive == "" {
+		t.Fatalf("missing webvpnc post-auth directive cookie")
+	}
+	if !strings.Contains(directive, "p:t") || !strings.Contains(directive, "sh:") {
+		t.Fatalf("webvpnc directive missing p:t/sh: %q", directive)
+	}
+	if strings.Contains(directive, "fu:") || strings.Contains(directive, "fh:") || strings.Contains(directive, "lu:") {
+		t.Fatalf("webvpnc directive must NOT carry fu:/fh:/lu: (regression): %q", directive)
+	}
+}
+
+// TestPhase2SimpleFormPath exercises Cisco Secure Client's SIMPLE auth path:
+// the auth-reply arrives application/x-www-form-urlencoded ("username=...",
+// then "password=...") with NO body <opaque>, and the pre-auth session is
+// carried in the webvpncontext cookie set on the auth-request responses.
+func TestPhase2SimpleFormPath(t *testing.T) {
+	s, _, _ := freshServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// Phase 2a: init -> username form; grab the webvpncontext session cookie.
+	resp, err := http.Post(ts.URL+"/", "application/xml", strings.NewReader(newInitBody()))
+	if err != nil {
+		t.Fatalf("init POST: %v", err)
+	}
+	var ctx string
+	for _, c := range resp.Cookies() {
+		if c.Name == "webvpncontext" && c.Value != "" {
+			ctx = c.Value
+		}
+	}
+	resp.Body.Close()
+	if ctx == "" {
+		t.Fatalf("init did not set webvpncontext cookie")
+	}
+
+	formPost := func(bodyStr string) *http.Response {
+		req, _ := http.NewRequest("POST", ts.URL+"/auth", strings.NewReader(bodyStr))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Cookie", "webvpncontext="+ctx)
+		r, e := http.DefaultClient.Do(req)
+		if e != nil {
+			t.Fatalf("form POST %q: %v", bodyStr, e)
+		}
+		return r
+	}
+
+	// Step 1: form-urlencoded username -> password form.
+	resp = formPost("username=alice")
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `type="auth-request"`) || !strings.Contains(string(body), `name="password"`) {
+		t.Fatalf("expected password form after form username, got: %s", body)
+	}
+
+	// Step 2: form-urlencoded password -> complete with webvpn session cookie.
+	resp = formPost("password=hunter2")
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `type="complete"`) {
+		t.Fatalf("expected complete via form path, got: %s", body)
+	}
+	hasWebVPN := false
+	for _, c := range resp.Cookies() {
+		if c.Name == "webvpn" && c.Value != "" {
+			hasWebVPN = true
+		}
+	}
+	if !hasWebVPN {
+		t.Fatalf("form path: missing webvpn session cookie: %s", body)
 	}
 }
 
@@ -201,9 +328,22 @@ func TestPhase2AuthFailure(t *testing.T) {
 		t.Fatalf("missing opaque id")
 	}
 
-	// Phase 2b: wrong password.
+	// Phase 2b step 1: submit username -> password form.
 	resp, err = http.Post(ts.URL+"/auth", "application/xml",
-		strings.NewReader(newAuthReplyBody(opaqueID, "alice", "wrong")))
+		strings.NewReader(newAuthReplyUsername(opaqueID, "alice")))
+	if err != nil {
+		t.Fatalf("username POST: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	opaqueID = extractOpaqueID(string(body))
+	if opaqueID == "" {
+		t.Fatalf("missing opaque id in password form: %s", body)
+	}
+
+	// Phase 2b step 2: wrong password -> auth-request retry with error message.
+	resp, err = http.Post(ts.URL+"/auth", "application/xml",
+		strings.NewReader(newAuthReplyPassword(opaqueID, "wrong")))
 	if err != nil {
 		t.Fatalf("auth POST: %v", err)
 	}
@@ -228,7 +368,11 @@ func TestPhase2AuthEmptyOpaque(t *testing.T) {
 	ts := httptest.NewServer(s)
 	defer ts.Close()
 
-	// No prior phase 2a; supplies an opaque the server never minted.
+	// No prior phase 2a; supplies an opaque the server never minted. Because the
+	// reply carries a username, the handler (matching stock ocserv's stateless
+	// init, where the session is created on the username step) recovers
+	// gracefully: it mints a fresh session, stashes the username, and prompts for
+	// the password rather than erroring.
 	resp, err := http.Post(ts.URL+"/auth", "application/xml",
 		strings.NewReader(newAuthReplyBody("BOGUS", "alice", "hunter2")))
 	if err != nil {
@@ -239,11 +383,8 @@ func TestPhase2AuthEmptyOpaque(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if !strings.Contains(string(body), `type="auth-request"`) {
-		t.Fatalf("expected auth-request, got: %s", body)
-	}
-	if !strings.Contains(string(body), "expired") && !strings.Contains(string(body), "sign in") {
-		t.Fatalf("expected resync message, got: %s", body)
+	if !strings.Contains(string(body), `type="auth-request"`) || !strings.Contains(string(body), `name="password"`) {
+		t.Fatalf("expected graceful restart at the password form, got: %s", body)
 	}
 }
 
@@ -355,11 +496,33 @@ func TestEndToEndPhase23AndTunnel(t *testing.T) {
 		t.Fatalf("missing opaque id: %s", body)
 	}
 
-	// Phase 2b.
-	body = postAndRead(t, ts.URL+"/auth", newAuthReplyBody(opaqueID, "alice", "hunter2"))
-	token := extractSessionToken(body)
+	// Phase 2b: 2-step simple auth (username then password). The session token
+	// is delivered via the Set-Cookie: webvpn header (stock-ocserv / Cisco Secure
+	// Client shape), not an XML element.
+	uResp, err := http.Post(ts.URL+"/auth", "text/xml", strings.NewReader(newAuthReplyUsername(opaqueID, "alice")))
+	if err != nil {
+		t.Fatalf("username POST: %v", err)
+	}
+	uBody, _ := io.ReadAll(uResp.Body)
+	uResp.Body.Close()
+	opaqueID = extractOpaqueID(string(uBody))
+	if opaqueID == "" {
+		t.Fatalf("missing opaque in password form: %s", uBody)
+	}
+	authResp, err := http.Post(ts.URL+"/auth", "text/xml", strings.NewReader(newAuthReplyPassword(opaqueID, "hunter2")))
+	if err != nil {
+		t.Fatalf("auth POST: %v", err)
+	}
+	authResp.Body.Close()
+	var token string
+	for _, c := range authResp.Cookies() {
+		if c.Name == "webvpn" && c.Value != "" {
+			token = c.Value
+			break
+		}
+	}
 	if token == "" {
-		t.Fatalf("missing session token: %s", body)
+		t.Fatalf("missing webvpn session cookie")
 	}
 
 	// Phase 3 + binary tunnel: raw TCP dial.
@@ -483,6 +646,17 @@ func postAndRead(t *testing.T, url, body string) string {
 		t.Fatalf("POST %s status=%d body=%s", url, resp.StatusCode, b)
 	}
 	return string(b)
+}
+
+func TestDTLSAddressForRequest(t *testing.T) {
+	r := httptest.NewRequest(http.MethodConnect, "https://eracloud.app/CSCOSSLC/tunnel", nil)
+	r.Host = "eracloud.app:443"
+	if got := dtlsAddressForRequest(r, Config{ServerName: "vpn.eracloud.app"}); got != "eracloud.app" {
+		t.Fatalf("dtlsAddressForRequest host = %q, want eracloud.app", got)
+	}
+	if got := dtlsAddressForRequest(nil, Config{ServerName: "vpn.eracloud.app"}); got != "vpn.eracloud.app" {
+		t.Fatalf("dtlsAddressForRequest fallback = %q, want vpn.eracloud.app", got)
+	}
 }
 
 // TestServerCloseUnblocksAccept ensures Accept returns ErrServerClosed

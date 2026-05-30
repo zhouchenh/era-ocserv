@@ -113,6 +113,32 @@ func cstpAuthReplyBody(opaqueID, user, pass string) string {
 </config-auth>`, opaqueID, user, pass)
 }
 
+func cstpAuthReplyUsername(opaqueID, user string) string {
+	return fmt.Sprintf(`<config-auth client="vpn" type="auth-reply"><opaque is-for="sg"><session-id>%s</session-id></opaque><auth><username>%s</username></auth></config-auth>`, opaqueID, user)
+}
+
+func cstpAuthReplyPassword(opaqueID, pass string) string {
+	return fmt.Sprintf(`<config-auth client="vpn" type="auth-reply"><opaque is-for="sg"><session-id>%s</session-id></opaque><auth><password>%s</password></auth></config-auth>`, opaqueID, pass)
+}
+
+// cstpDoAuth runs the 2-step simple auth flow (username then password) over the
+// hijacked CSTP stream and returns the final /auth response — a complete on
+// success, or an auth-request retry on bad creds.
+func cstpDoAuth(t *testing.T, w *bufio.Writer, r *bufio.Reader, opaqueID, user, pass string) *http.Response {
+	t.Helper()
+	resp := writeHTTPPost(t, w, r, "/auth", cstpAuthReplyUsername(opaqueID, user))
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("username step status=%d body=%s", resp.StatusCode, body)
+	}
+	op := extractTag(string(body), "session-id")
+	if op == "" {
+		t.Fatalf("missing opaque in password form: %s", body)
+	}
+	return writeHTTPPost(t, w, r, "/auth", cstpAuthReplyPassword(op, pass))
+}
+
 func extractTag(body, tag string) string {
 	open := "<" + tag + ">"
 	closeT := "</" + tag + ">"
@@ -187,7 +213,7 @@ func TestUDS_CSTPInitAuthSequence(t *testing.T) {
 	}
 
 	// Phase 2b: auth-reply with correct creds.
-	resp = writeHTTPPost(t, w, r, "/auth", cstpAuthReplyBody(opaqueID, "alice", "hunter2"))
+	resp = cstpDoAuth(t, w, r, opaqueID, "alice", "hunter2")
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -196,8 +222,17 @@ func TestUDS_CSTPInitAuthSequence(t *testing.T) {
 	if !strings.Contains(string(body), `type="complete"`) {
 		t.Fatalf("expected complete, got: %s", body)
 	}
-	if extractTag(string(body), "session-token") == "" {
-		t.Fatalf("missing session token: %s", body)
+	// The session token is delivered via Set-Cookie: webvpn (stock-ocserv /
+	// Cisco Secure Client shape), not a <session-token> element.
+	hasWebVPN := false
+	for _, c := range resp.Cookies() {
+		if c.Name == "webvpn" && c.Value != "" {
+			hasWebVPN = true
+			break
+		}
+	}
+	if !hasWebVPN {
+		t.Fatalf("missing webvpn session cookie: %s", body)
 	}
 	_ = clientC.Close()
 }
@@ -225,7 +260,7 @@ func TestUDS_CSTPBadCreds(t *testing.T) {
 		t.Fatalf("init missing opaque id")
 	}
 
-	resp = writeHTTPPost(t, w, r, "/auth", cstpAuthReplyBody(opaqueID, "alice", "wrong"))
+	resp = cstpDoAuth(t, w, r, opaqueID, "alice", "wrong")
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -265,15 +300,21 @@ func TestUDS_CSTPTunnelHandshake(t *testing.T) {
 	resp.Body.Close()
 	opaqueID := extractTag(string(body), "session-id")
 
-	resp = writeHTTPPost(t, w, r, "/auth", cstpAuthReplyBody(opaqueID, "alice", "hunter2"))
+	resp = cstpDoAuth(t, w, r, opaqueID, "alice", "hunter2")
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if !strings.Contains(string(body), `type="complete"`) {
 		t.Fatalf("phase 2 didn't complete: %s", body)
 	}
-	token := extractTag(string(body), "session-token")
+	token := ""
+	for _, c := range resp.Cookies() {
+		if c.Name == "webvpn" && c.Value != "" {
+			token = c.Value
+			break
+		}
+	}
 	if token == "" {
-		t.Fatalf("no session token")
+		t.Fatalf("no webvpn session cookie")
 	}
 
 	// Phase 3: CONNECT /CSCOSSLC/tunnel with the cookie.

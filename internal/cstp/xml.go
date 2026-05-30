@@ -39,9 +39,8 @@ type authEnvelope struct {
 
 	// Phase 2c-only fields. SessionToken / SessionID are both used so
 	// clients that consult either survive.
-	SessionToken string      `xml:"session-token,omitempty"`
-	SessionID    string      `xml:"session-id,omitempty"`
-	Config       *authConfig `xml:"config,omitempty"`
+	SessionToken string `xml:"session-token,omitempty"`
+	SessionID    string `xml:"session-id,omitempty"`
 }
 
 type authVersion struct {
@@ -80,16 +79,6 @@ type authFormItem struct {
 	Label string `xml:"label,attr,omitempty"`
 	Name  string `xml:"name,attr"`
 	Type  string `xml:"type,attr,omitempty"`
-}
-
-type authConfig struct {
-	Client  string             `xml:"client,attr,omitempty"`
-	Type    string             `xml:"type,attr,omitempty"`
-	VPNBase *authVPNBaseConfig `xml:"vpn-base-config,omitempty"`
-}
-
-type authVPNBaseConfig struct {
-	ServerCertHash string `xml:"server-cert-hash,omitempty"`
 }
 
 // parsedAuth is the digested shape callers actually care about. The
@@ -133,72 +122,20 @@ func parseAuthRequest(r io.Reader) (parsedAuth, error) {
 	return pa, nil
 }
 
-// buildAuthRequest renders the phase 2a server response: an
-// auth-request prompting for username + password with the given opaque
-// session id round-tripped to the client.
-func buildAuthRequest(opaqueID, prompt string) ([]byte, error) {
+// buildAuthForm renders an auth-request prompting for a single field, with the
+// given opaque session id round-tripped to the client.
+//
+// era-ocserv uses stock ocserv's 2-step SIMPLE auth path: a username-only form,
+// then a password-only form, each a single <input>. This is deliberate — a
+// single combined username+password form pushes the iOS Cisco Secure Client
+// onto its aggregate-auth path (it then requires an X-Aggregate-Auth response
+// header just to pass the form, and afterwards refuses to send the CSTP CONNECT
+// even on a byte-for-byte stock-shaped complete). The single-input forms drive
+// the simple path that stock ocserv uses and that connects iOS end-to-end.
+func buildAuthForm(opaqueID, message string, inputs []authFormItem) ([]byte, error) {
 	env := authEnvelope{
 		Client: "vpn",
 		Type:   authTypeAuthRequest,
-		AggVer: "2",
-		Version: &authVersion{
-			Who:   "sg",
-			Value: "0.1(1)",
-		},
-		Opaque: &authOpaque{IsFor: "sg", SessionID: opaqueID},
-		Auth: &authBlock{
-			ID:      "main",
-			Message: prompt,
-			Form: &authForm{
-				Action: "/auth",
-				Method: "post",
-				Inputs: []authFormItem{
-					{Label: "Username:", Name: "username", Type: "text"},
-					{Label: "Password:", Name: "password", Type: "password"},
-				},
-			},
-		},
-	}
-	return marshalAuth(&env)
-}
-
-// buildAuthComplete renders the phase 2c server response: an
-// auth-complete carrying the session token the client will echo on the
-// CONNECT request, plus an informational success message.
-func buildAuthComplete(sessionToken, opaqueID, certHashBase64 string) ([]byte, error) {
-	env := authEnvelope{
-		Client:       "vpn",
-		Type:         authTypeComplete,
-		AggVer:       "2",
-		Version:      &authVersion{Who: "sg", Value: "0.1(1)"},
-		SessionToken: sessionToken,
-		SessionID:    opaqueID,
-		Auth: &authBlock{
-			ID:      "success",
-			Title:   "SSL VPN Service",
-			Message: "Logged in",
-		},
-	}
-	if certHashBase64 != "" {
-		env.Config = &authConfig{
-			Client: "vpn",
-			Type:   "private",
-			VPNBase: &authVPNBaseConfig{
-				ServerCertHash: certHashBase64,
-			},
-		}
-	}
-	return marshalAuth(&env)
-}
-
-// buildAuthError renders an auth-request with an error message,
-// returned when phase 2b credentials fail verification. The client
-// re-prompts the user.
-func buildAuthError(opaqueID, message string) ([]byte, error) {
-	env := authEnvelope{
-		Client: "vpn",
-		Type:   authTypeAuthRequest,
-		AggVer: "2",
 		Version: &authVersion{
 			Who:   "sg",
 			Value: "0.1(1)",
@@ -210,22 +147,73 @@ func buildAuthError(opaqueID, message string) ([]byte, error) {
 			Form: &authForm{
 				Action: "/auth",
 				Method: "post",
-				Inputs: []authFormItem{
-					{Label: "Username:", Name: "username", Type: "text"},
-					{Label: "Password:", Name: "password", Type: "password"},
-				},
+				Inputs: inputs,
 			},
 		},
 	}
 	return marshalAuth(&env)
 }
 
+// buildUsernameRequest renders the step-1 auth-request (username-only form).
+func buildUsernameRequest(opaqueID, message string) ([]byte, error) {
+	return buildAuthForm(opaqueID, message, []authFormItem{
+		{Label: "Username:", Name: "username", Type: "text"},
+	})
+}
+
+// buildPasswordRequest renders the step-2 auth-request (password-only form).
+func buildPasswordRequest(opaqueID, message string) ([]byte, error) {
+	return buildAuthForm(opaqueID, message, []authFormItem{
+		{Label: "Password:", Name: "password", Type: "password"},
+	})
+}
+
+// buildAuthComplete renders the phase 2c server response: the minimal
+// type="complete" success envelope that stock ocserv emits and that Cisco
+// Secure Client accepts before issuing the CSTP CONNECT.
+//
+// It is deliberately just <version> + <auth id="success"><title> — NO <config>
+// and NO <vpn-profile-manifest>. A side-by-side capture against the iOS Cisco
+// Secure Client showed stock ocserv (with no client profile configured) sends
+// exactly this 189-byte body and connects instantly, whereas advertising a
+// profile manifest sent the iOS Network Extension into a pre-tunnel profile
+// fetch it never completed (it went silent after the complete and never issued
+// the CONNECT). The post-auth instruction the client actually needs is the
+// `webvpnc` directive cookie (see profile.go), not an XML <config>.
+//
+// The session credential is delivered ONLY via the Set-Cookie: webvpn header
+// (set by the caller), NEVER in an XML element. Carrying it in a
+// <session-token> element (an OpenConnect-only extension) plus extra
+// <session-id>/<message> siblings makes Cisco Secure Client reject the
+// complete and silently refuse to send the CONNECT — while OpenConnect, which
+// harvests the token from <session-token> and is lenient about the rest,
+// interoperated regardless.
+func buildAuthComplete() ([]byte, error) {
+	env := authEnvelope{
+		Client:  "vpn",
+		Type:    authTypeComplete,
+		Version: &authVersion{Who: "sg", Value: "0.1(1)"},
+		Auth: &authBlock{
+			ID:    "success",
+			Title: "SSL VPN Service",
+		},
+	}
+	return marshalAuth(&env)
+}
+
 func marshalAuth(env *authEnvelope) ([]byte, error) {
-	buf, err := xml.MarshalIndent(env, "", "  ")
+	// Stock ocserv prefixes every config-auth message with the XML declaration:
+	// worker-auth.c's oc_success_msg_head (the type="complete") and OC_LOGIN_START
+	// (the auth-request) both begin with
+	// `<?xml version="1.0" encoding="UTF-8"?>\n`, and the iOS Cisco Secure Client
+	// drives that wire form to a connected tunnel — so we match it. We emit a
+	// compact (un-indented) body: inter-element whitespace is insignificant XML,
+	// and OpenConnect interoperates with either.
+	buf, err := xml.Marshal(env)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]byte, 0, len(buf)+len(xml.Header))
+	out := make([]byte, 0, len(xml.Header)+len(buf))
 	out = append(out, []byte(xml.Header)...)
 	out = append(out, buf...)
 	return out, nil
