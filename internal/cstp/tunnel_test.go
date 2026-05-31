@@ -226,28 +226,20 @@ func TestTunnelHeartbeatDPD(t *testing.T) {
 	}
 }
 
-// TestTunnelKeepaliveEmittedWhenOutboundIdle confirms the heartbeat
-// path can emit pktKeepalive when there has been no outbound traffic
-// for the keepalive interval, even when DPD is disabled.
-func TestTunnelKeepaliveEmittedWhenOutboundIdle(t *testing.T) {
+// TestTunnelDPDEmittedWhenOutboundIdle confirms the heartbeat proactively
+// emits a server DPD-request when our outbound channel has been idle, so a
+// strict client that waits for server liveness (Cisco Secure Client) gets a
+// witness well inside its establishment window instead of timing out.
+func TestTunnelDPDEmittedWhenOutboundIdle(t *testing.T) {
 	fc := newFakeClock(time.Date(2026, 5, 27, 0, 0, 0, 0, time.UTC))
 	tun, client := pipeTunnel(t, fc, Config{
-		DPDInterval:       1 << 20, // suppress DPD by making it huge
+		DPDInterval:       1 << 20, // large so only the outbound-idle path fires
 		KeepaliveInterval: 1,
 		IdleTimeout:       1 << 20,
 	})
 	defer tun.Close()
 
-	// Pretend the inbound channel has had activity so DPD does not
-	// fire. We do this by writing some other-purpose frame in: a
-	// keepalive frame which the server treats as "saw something".
-	go func() {
-		frame := make([]byte, frameHeaderLen)
-		_, _ = encodeFrame(frame, pktKeepalive, nil)
-		_, _ = client.Write(frame)
-	}()
-
-	gotKA := make(chan struct{}, 1)
+	gotDPD := make(chan struct{}, 1)
 	go func() {
 		hdr := make([]byte, frameHeaderLen)
 		buf := make([]byte, 4096)
@@ -256,9 +248,9 @@ func TestTunnelKeepaliveEmittedWhenOutboundIdle(t *testing.T) {
 			if err != nil {
 				return
 			}
-			if typ == pktKeepalive {
+			if typ == pktDPDOut {
 				select {
-				case gotKA <- struct{}{}:
+				case gotDPD <- struct{}{}:
 				default:
 				}
 				return
@@ -269,10 +261,10 @@ func TestTunnelKeepaliveEmittedWhenOutboundIdle(t *testing.T) {
 	deadline := time.After(3 * time.Second)
 	for {
 		select {
-		case <-gotKA:
+		case <-gotDPD:
 			return
 		case <-deadline:
-			t.Fatalf("heartbeat did not emit keepalive within 3s wall time")
+			t.Fatalf("heartbeat did not emit DPD within 3s wall time")
 		default:
 			fc.Advance(500 * time.Millisecond)
 			time.Sleep(50 * time.Millisecond)

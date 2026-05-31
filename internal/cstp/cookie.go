@@ -170,6 +170,22 @@ func (t *sessionTable) consume(s *session) {
 	t.deleteLocked(s)
 }
 
+// touch refreshes a session's expiry so the reconnect cookie stays valid for
+// the lifetime of an actively-(re)connecting client. Cisco Secure Client
+// re-presents the SAME webvpn cookie on every (re)CONNECT (its two-phase
+// connect + reconnect-on-network-change behaviour), so — unlike consume's
+// single-use model — we keep the row alive and push its TTL forward on each
+// CONNECT, mirroring stock ocserv's exptime refresh. Expired rows are still
+// reaped inline by lookupToken once the client stops reconnecting.
+func (t *sessionTable) touch(s *session) {
+	if s == nil {
+		return
+	}
+	t.mu.Lock()
+	s.expiresAt = t.now().Add(t.ttl)
+	t.mu.Unlock()
+}
+
 func (t *sessionTable) deleteLocked(s *session) {
 	if s.opaqueID != "" {
 		delete(t.byOpaque, s.opaqueID)

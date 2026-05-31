@@ -56,6 +56,11 @@ type config struct {
 	// into the same tun device the CSTP path uses. Pass 'default' to take
 	// dtlsuds.DefaultSocketPath. Empty disables (default).
 	dtlsUDSSocket string
+	// disableDTLS suppresses ALL DTLS advertisement in the CSTP CONNECT
+	// response so clients carry their data plane over CSTP/TLS (TCP) only.
+	// Diagnostic/fallback for edges where the DTLS-over-UDP leg cannot
+	// round-trip.
+	disableDTLS bool
 }
 
 func parseFlags() config {
@@ -84,6 +89,8 @@ func parseFlags() config {
 	flag.StringVar(&c.logLevel, "log-level", "info", "log level: debug|info|warn|error")
 	flag.StringVar(&c.facadeAdminURL, "facade-admin-url", "", "era-facade admin base URL for shared-edge DTLS bindings (e.g. http://127.0.0.1:8780)")
 	flag.StringVar(&c.facadeAdminToken, "facade-admin-token", "", "era-facade admin service token used to publish shared-edge DTLS bindings")
+	flag.BoolVar(&c.disableDTLS, "disable-dtls", false,
+		"suppress all DTLS advertisement so clients use CSTP/TLS (TCP) for data (diagnostic/fallback)")
 	flag.StringVar(&c.dtlsUDSSocket, "dtls-uds-socket", "",
 		"DTLS UDS DGRAM socket path (Wave IV O-S). Empty disables. "+
 			"Pass 'default' to use the canonical "+dtlsuds.DefaultSocketPath+".")
@@ -228,6 +235,7 @@ func run() error {
 		SessionTimeout:       24 * time.Hour,
 		DTLSBindingInstaller: dtlsBindings,
 		DTLSBindingSource:    sharedEdgeDTLSBindingSource,
+		DTLSDisabled:         cfg.disableDTLS,
 	})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -55,32 +56,80 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	headers := w.Header()
 	emitCSTPHeaders(headers, s.cfg, id, innerMTU)
+	// iOS Cisco Secure Client requires an EXPLICIT IPv6 split-include route to
+	// actually install an IPv6 route and pass v6 traffic — a tunnel-all config
+	// alone is not enough. Without it the (v6-primary) tunnel comes up but
+	// carries no IPv6, the post-connect connectivity check fails, and the
+	// client tears down with "Reconnecting the VPN tunnel" in a loop. Stock
+	// ocserv emits exactly this for is_ios + full-ipv6 + default-route clients
+	// (worker-vpn.c: "Anyconnect on IOS requires this route in order to use
+	// IPv6"). 2000::/3 is the entire global-unicast v6 block, so this remains
+	// effectively tunnel-all for v6.
+	if id.IPv6.IsValid() && iosUserAgent(r) &&
+		strings.EqualFold(r.Header.Get("X-CSTP-Full-IPv6-Capability"), "true") {
+		headers.Add("X-CSTP-Split-Include-IP6", "2000::/3")
+		// 64:ff9b::/96 is the NAT64 well-known prefix. With a DNS64 resolver,
+		// v4-only domains resolve to 64:ff9b::<v4>, which lies OUTSIDE 2000::/3,
+		// so it needs its own split-include route to travel through the tunnel
+		// -> host NAT64 -> v4. (CLAT still covers bare v4 literals via the inner
+		// v4 lease + SIIT; this adds the DNS64 path for v4-only hostnames.)
+		headers.Add("X-CSTP-Split-Include-IP6", "64:ff9b::/96")
+	}
+	// Honor the client's address-family request (ocserv no_ipv4): a client that
+	// asked for IPv6-only gets no inner v4 lease.
+	if clientSuppressedV4(r) {
+		headers.Del("X-CSTP-Address")
+		headers.Del("X-CSTP-Netmask")
+	}
+	// NOTE: we deliberately emit NO IPv4 split route. The iOS Cisco Secure Client
+	// rejects ANY v4 route customization ("invalid configuration") when the inner
+	// lease is a /32 — there is no on-link v4 subnet to anchor split routes on.
+	// Both a 27-prefix split-include and a 4-entry split-exclude were rejected on
+	// the wire. Stock ocserv's proven apple-ios config also leaves v4 as tunnel-
+	// all (its `route` directives are commented out). So v4 stays plain 0.0.0.0/0
+	// tunnel-all; iOS keeps loopback/link-local/multicast on the local link by
+	// itself. See iosV4SplitExclude for the set to use on a /24-lease/non-iOS path.
+	// DTLS advertisement. Suppressed entirely when DTLSDisabled so the client
+	// runs its data plane over CSTP/TLS (TCP) only — the diagnostic/fallback
+	// path for edges where the DTLS-over-UDP leg cannot round-trip.
 	var tunnelDTLS *dtlsBindingState
-	if s.cfg.DTLSBindingInstaller != nil && s.cfg.DTLSBindingSource != nil {
-		if binding, ok := s.cfg.DTLSBindingSource(r, id); ok {
-			if secret, err := issueDTLSSecret(s.cfg.RandRead); err == nil {
-				binding.PSK = secret
-				address := dtlsAddressForRequest(r, s.cfg)
-				if err := s.cfg.DTLSBindingInstaller.Upsert(r.Context(), binding); err == nil {
-					emitDTLSHeaders(headers, secret[:], innerMTU, address)
-					tunnelDTLS = &dtlsBindingState{
-						installer:       s.cfg.DTLSBindingInstaller,
-						binding:         binding,
-						refreshInterval: s.cfg.DTLSBindingRefreshInterval,
+	if !s.cfg.DTLSDisabled {
+		if s.cfg.DTLSBindingInstaller != nil && s.cfg.DTLSBindingSource != nil {
+			if binding, ok := s.cfg.DTLSBindingSource(r, id); ok {
+				if secret, err := issueDTLSSecret(s.cfg.RandRead); err == nil {
+					binding.PSK = secret
+					address := dtlsAddressForRequest(r, s.cfg)
+					if err := s.cfg.DTLSBindingInstaller.Upsert(r.Context(), binding); err == nil {
+						emitDTLSHeaders(headers, secret[:], innerMTU, address)
+						tunnelDTLS = &dtlsBindingState{
+							installer:       s.cfg.DTLSBindingInstaller,
+							binding:         binding,
+							refreshInterval: s.cfg.DTLSBindingRefreshInterval,
+						}
 					}
 				}
 			}
 		}
-	}
-	if tunnelDTLS == nil {
-		// Legacy fallback: when shared-edge binding publication is unavailable,
-		// keep the old exporter-based path so loopback TLS mode still advertises
-		// DTLS when the outer connection exposes RFC 5705 exporter material.
-		dtlsSecret, dtlsOK := deriveDTLSSecret(r)
-		if dtlsOK {
-			emitDTLSHeaders(headers, dtlsSecret, innerMTU, dtlsAddressForRequest(r, s.cfg))
+		if tunnelDTLS == nil {
+			// Legacy fallback: when shared-edge binding publication is unavailable,
+			// keep the old exporter-based path so loopback TLS mode still advertises
+			// DTLS when the outer connection exposes RFC 5705 exporter material.
+			dtlsSecret, dtlsOK := deriveDTLSSecret(r)
+			if dtlsOK {
+				emitDTLSHeaders(headers, dtlsSecret, innerMTU, dtlsAddressForRequest(r, s.cfg))
+			}
 		}
 	}
+
+	// TEMP DIAGNOSTIC: dump the client's CONNECT request headers and the full
+	// response header bag so we can see exactly what a strict iOS client asks
+	// for vs what we answer (and diff against the openconnect path it accepts).
+	slog.Info("cstp connect debug",
+		"device", id.DeviceID,
+		"innerMTU", innerMTU,
+		"req", fmt.Sprintf("%v", r.Header),
+		"resp", fmt.Sprintf("%v", headers),
+	)
 
 	// http.ResponseWriter ignores 200 on CONNECT by default; we
 	// upgrade it manually to "200 CONNECTED" the way real ocserv does.
@@ -95,7 +144,19 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.sessions.consume(sess)
+	// Do NOT consume (delete) the session cookie on CONNECT. Cisco Secure
+	// Client's normal lifecycle is a TWO-PHASE connect: it brings the tunnel
+	// up, immediately sends AC_PKT_DISCONN "Reconnecting the VPN tunnel", then
+	// re-CONNECTs with the SAME cached webvpn cookie (no re-auth). Consuming the
+	// cookie on the first CONNECT made that reconnect's CONNECT return 401
+	// (token gone) -> the client surfaces "secure gateway has rejected the
+	// connection" and loops until it gives up. Stock ocserv keeps the cookie
+	// valid and reusable for the session lifetime (it refreshes exptime /
+	// increments in_use rather than deleting). We keep the row until its TTL
+	// (SessionTimeout) or explicit teardown; lookupToken reaps expired rows.
+	// The bridge displaces any prior tunnel for the same /128, so the reconnect
+	// cleanly replaces the old tunnel without a leak.
+	s.sessions.touch(sess)
 	t := s.newTunnel(conn, rw, id, sess.token, tunnelDTLS)
 	select {
 	case s.tunnels <- t:
@@ -193,25 +254,81 @@ func atoiDefault(s string, fallback int) int {
 	return v
 }
 
+// ClatPlaceholderV4 is the inner IPv4 address advertised to every AnyConnect
+// client (X-CSTP-Address) and used as the SIIT/CLAT translation source in the
+// data-plane bridge (cmd/era-ocserv/bridge.go references this same var so the
+// wire address and the SIIT source can never drift). 192.0.0.1 is the RFC 7335
+// §4 IPv4 Service-Continuity / CLAT address. (We earlier switched to a private
+// 172.23.115.2 after a suspected collision with the iOS system CLAT, but that
+// reassert was a FACADE-path observation — the facade looped for unrelated
+// reasons — so we are re-validating the RFC-standard address on the clean path.)
+var ClatPlaceholderV4 = netip.MustParseAddr("192.0.0.1")
+
+// ClatPlaceholderV4Netmask is the subnet mask advertised with ClatPlaceholderV4.
+// /32 mirrors the v6 /128 point-to-point model: no on-link subnet, all v4 via
+// the default route. (The earlier "/32 loops, use /24" note was also a
+// facade-path observation; re-validating /32 on the clean direct path.)
+const ClatPlaceholderV4Netmask = "255.255.255.255"
+
+// iosV4SplitExclude is the set of special-use IPv4 ranges that ideally would not
+// be tunnelled — 0.0.0.0/8 (this-network), 127.0.0.0/8 (loopback),
+// 169.254.0.0/16 (link-local), 224.0.0.0/3 (multicast + reserved). It is
+// intentionally NOT emitted today (see handleConnect): the iOS Cisco Secure
+// Client rejects any v4 split route — include OR exclude — when the inner lease
+// is a /32, because there is no on-link v4 subnet to anchor split routes on. We
+// advertise plain 0.0.0.0/0 tunnel-all for v4 (matching stock ocserv's apple-ios
+// config) and iOS keeps loopback/link-local/multicast local on its own. Retained
+// for a future /24-lease or non-iOS (desktop) emit path via X-CSTP-Split-Exclude.
+var iosV4SplitExclude = []string{
+	"0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/3",
+}
+
+// referenced to keep iosV4SplitExclude live for the documented future emit path
+// without an unused-var lint; the slice itself carries the canonical set.
+var _ = iosV4SplitExclude
+
+// clientSuppressedV4 reports whether the client asked NOT to be given an inner
+// IPv4 (X-CSTP-Address-Type without "IPv4"), mirroring ocserv's no_ipv4 gate
+// (worker-http.c:620-624). The iPhone sends "IPv6,IPv4" so it gets v4.
+func clientSuppressedV4(r *http.Request) bool {
+	at := r.Header.Get("X-CSTP-Address-Type")
+	return at != "" && !strings.Contains(at, "IPv4")
+}
+
 // emitCSTPHeaders sets the X-CSTP-* header bag on w for the 200
 // CONNECTED response. The header set matches protocol doc §1.6.
 func emitCSTPHeaders(h http.Header, cfg Config, id Identity, innerMTU int) {
 	h.Set("X-CSTP-Version", "1")
-	h.Set("X-CSTP-Server-Version", "era-ocserv 0.1")
+	// X-CSTP-Server-Name is how Cisco Secure Client recognises the gateway
+	// family; stock ocserv sends "OpenConnect VPN Server" (PACKAGE_NAME) as the
+	// second header. The non-standard X-CSTP-Server-Version we used before is
+	// not a header the iOS client defines, so a strict client can fail its
+	// gateway-identity check. Match stock.
+	h.Set("X-CSTP-Server-Name", "OpenConnect VPN Server")
 
 	if id.IPv6.IsValid() {
-		// X-CSTP-Address-IP6 carries the per-device /128 with prefix
-		// length so clients can configure the inner interface.
-		h.Set("X-CSTP-Address-IP6", id.IPv6.String())
+		// X-CSTP-Address-IP6 is the device's inner IPv6 as a /128 host lease —
+		// matching stock ocserv's default ipv6-subnet-prefix (128) and the
+		// apple-ios test config the iOS client is validated against. A /64 would
+		// tell iOS the whole pool /64 is ON-LINK, so it does Neighbor Discovery
+		// for in-/64 destinations that this /128 point-to-point tun never
+		// answers — black-holing v6 and failing iOS's post-connect reachability
+		// check ("Reconnecting the VPN tunnel"). With no on-link subnet iOS
+		// routes ALL global v6 via the tunnel route we advertise as
+		// X-CSTP-Split-Include-IP6: 2000::/3 (handleConnect). The /128 is what
+		// the reconciler routes on the server side.
+		h.Set("X-CSTP-Address-IP6", id.IPv6.Addr().String()+"/128")
 	}
 
-	// CLAT placeholder per ADR 0035: every client receives the same
-	// 192.0.0.1/32 inner source. era-ocserv's stateless SIIT data plane
-	// (internal/clat + internal/clatxlat) translates this inner v4 to/from
-	// 64:ff9b::<v4dst> sourced from the device's CLAT /128, which egresses
-	// through the existing external 464PLAT. CLAT-only: no NAT64/NAT44/TAYGA.
-	h.Set("X-CSTP-Address", "192.0.0.1")
-	h.Set("X-CSTP-Netmask", "255.255.255.255")
+	// CLAT inner source: every client receives the same inner IPv4. era-ocserv's
+	// stateless SIIT data plane (internal/clatxlat) translates this inner v4
+	// to/from 64:ff9b::<v4dst> sourced from the device's CLAT /128. We advertise
+	// the RFC 7335 §4 standard CLAT address 192.0.0.1/32 (see ClatPlaceholderV4).
+	// NOTE: on a 464XLAT carrier the iOS system CLAT may itself bind 192.0.0.1 —
+	// historically suspected to cause a duplicate-address reassert, but that was
+	// observed via the facade (which looped independently); validating here.
+	h.Set("X-CSTP-Address", ClatPlaceholderV4.String())
+	h.Set("X-CSTP-Netmask", ClatPlaceholderV4Netmask)
 
 	if cfg.ServerName != "" {
 		h.Set("X-CSTP-Hostname", cfg.ServerName)
@@ -246,18 +363,50 @@ func emitCSTPHeaders(h http.Header, cfg Config, id Identity, innerMTU int) {
 	if cfg.IdleTimeout > 0 {
 		h.Set("X-CSTP-Idle-Timeout", strconv.Itoa(cfg.IdleTimeout))
 	} else {
-		h.Set("X-CSTP-Idle-Timeout", "0")
+		h.Set("X-CSTP-Idle-Timeout", "none")
 	}
-	h.Set("X-CSTP-Session-Timeout", "0")
+	// Values below mirror stock ocserv's cstp config block (worker-vpn.c)
+	// verbatim — "none" sentinels, not "0" — since that is what the iOS
+	// client is validated against.
+	h.Set("X-CSTP-Session-Timeout", "none")
+	// X-CSTP-Keep: keep the tunnel established across transient drops.
+	// Stock ocserv always emits this; the iOS client expects it.
+	h.Set("X-CSTP-Keep", "true")
+	h.Set("X-CSTP-TCP-Keepalive", "true")
 	h.Set("X-CSTP-MTU", strconv.Itoa(innerMTU))
 	h.Set("X-CSTP-Base-MTU", "1500")
 	h.Set("X-CSTP-Tunnel-All-DNS", "true")
+	// Stock ocserv always emits Client-Bypass-Protocol; it tells the client how
+	// to treat the address family that is NOT tunnelled. "false" = no local
+	// bypass (consistent with our tunnel-all design). Its absence leaves a
+	// strict client's v4-vs-v6 disposition ambiguous on this v6-primary tunnel.
+	h.Set("X-CSTP-Client-Bypass-Protocol", "false")
 	h.Set("X-CSTP-Smartcard-Removal-Disconnect", "true")
 	h.Set("X-CSTP-License", "accept")
 	h.Set("X-CSTP-DynDNS", "true")
 	h.Set("X-CSTP-Rekey-Time", "28800")
-	h.Set("X-CSTP-Rekey-Method", "ssl")
-	h.Set("X-CSTP-Disconnected-Timeout", "2400")
+	// Rekey-Method "ssl" promises an in-place TLS rehandshake to rekey the
+	// session — but era's data plane is Go crypto/tls, whose SERVER side cannot
+	// renegotiate at all, so "ssl" is an un-honorable tunnel parameter. iOS
+	// Cisco Secure Client records the advertised rekey method as a parameter it
+	// must honor; finding the server cannot do an SSL rekey it self-terminates
+	// with a config-apply reconfigure (termination reason "4h") ~150ms after
+	// Connected and auto-reconnects, looping. Stock ocserv gates this on safe
+	// TLS renegotiation and downgrades to "new-tunnel" when unavailable
+	// (worker-vpn.c:2275-2284) — which for a Go TLS server is always. We rekey
+	// by reconnecting (which we CAN do), so always advertise "new-tunnel".
+	h.Set("X-CSTP-Rekey-Method", "new-tunnel")
+	h.Set("X-CSTP-Disconnected-Timeout", "none")
+}
+
+// iosUserAgent reports whether the CONNECT request comes from Cisco Secure
+// Client on an Apple mobile OS. Stock ocserv (worker-vpn.c) special-cases
+// these clients; the User-Agent is e.g.
+// "Cisco AnyConnect VPN Agent for Apple iPhone 5.1.16.264".
+func iosUserAgent(r *http.Request) bool {
+	ua := strings.ToLower(r.Header.Get("User-Agent"))
+	return strings.Contains(ua, "apple") || strings.Contains(ua, "iphone") ||
+		strings.Contains(ua, "ipad") || strings.Contains(ua, "ios")
 }
 
 // emitDTLSHeaders advertises the DTLS PSK-NEGOTIATE channel to the
@@ -274,14 +423,24 @@ func emitDTLSHeaders(h http.Header, secret []byte, innerMTU int, address string)
 	}
 	h.Set("X-DTLS-Port", "443")
 	h.Set("X-DTLS-Rekey-Time", "28800")
-	h.Set("X-DTLS-Rekey-Method", "ssl")
+	// "new-tunnel", not "ssl": same reason as X-CSTP-Rekey-Method — the Go TLS
+	// server cannot do an in-place rehandshake rekey, so we rekey by reconnect.
+	h.Set("X-DTLS-Rekey-Method", "new-tunnel")
 	h.Set("X-DTLS-Keepalive", "20")
 	h.Set("X-DTLS-DPD", "30")
-	dtlsMTU := innerMTU - 20
-	if dtlsMTU < 576 {
-		dtlsMTU = 576
-	}
-	h.Set("X-DTLS-MTU", strconv.Itoa(dtlsMTU))
+	// X-DTLS-MTU MUST equal X-CSTP-MTU (innerMTU). The iOS Cisco Secure Client
+	// sizes the tunnel interface to the DTLS MTU first (DTLS is its preferred
+	// channel), then bumps it to the TLS MTU the moment DTLS fails to come up on
+	// this path (UDP :443 is blocked end-to-end, client sends 0 UDP). That MTU
+	// change is reported as iOS "Reconfigure reason 16: New MTU configuration",
+	// which sets reasserting=true and tears the tunnel down into an endless
+	// reconnect loop. Stock ocserv never trips this because its DTLS actually
+	// establishes, so the client stays on the (smaller) DTLS MTU and never bumps.
+	// We cannot establish DTLS for this client, so we make the two MTUs identical:
+	// whichever channel iOS sizes the interface for, the applied MTU is the same
+	// value, so no New-MTU reconfigure ever fires. (Once a real DTLS data path
+	// exists, restore the proper innerMTU-overhead DTLS MTU here.)
+	h.Set("X-DTLS-MTU", strconv.Itoa(innerMTU))
 	// X-DTLS-Session-ID is required by legacy fake-resumption clients
 	// but unused by PSK-NEGOTIATE. We emit a stable random value so
 	// the header set looks complete to clients that parse it without
@@ -329,13 +488,21 @@ func deriveDTLSSecret(r *http.Request) ([]byte, bool) {
 func writeConnectResponse(rw io.Writer, h http.Header) error {
 	var sb strings.Builder
 	sb.WriteString("HTTP/1.1 200 CONNECTED\r\n")
-	// Emit headers in a stable order: well-known ones first, then the
-	// rest sorted. Cisco Secure Client doesn't care about ordering but
-	// stable output simplifies tests.
+	// Emit single-valued X-CSTP-* headers through this exact-cased ordered
+	// list. This is NOT just cosmetic: Cisco Secure Client (iOS) is
+	// case-SENSITIVE on these header names and silently rejects the whole
+	// tunnel config ("secure gateway has rejected the connection") when it
+	// cannot find them under the precise Cisco casing. Go's http.Header
+	// canonicalises keys (X-CSTP- -> X-Cstp-, DNS -> Dns, DynDNS -> Dyndns),
+	// so any X-CSTP-* header left to the generic map-iteration path below
+	// leaks onto the wire mis-cased. Keep this list aligned with the
+	// h.Set(...) keys in emitCSTPHeaders and with stock ocserv's casing
+	// (ocserv-src worker-vpn.c), which the iOS client accepts.
 	well := []string{
 		"X-CSTP-Version",
-		"X-CSTP-Server-Version",
+		"X-CSTP-Server-Name",
 		"X-CSTP-Hostname",
+		"X-CSTP-Default-Domain",
 		"X-CSTP-Address",
 		"X-CSTP-Netmask",
 		"X-CSTP-Address-IP6",
@@ -343,6 +510,18 @@ func writeConnectResponse(rw io.Writer, h http.Header) error {
 		"X-CSTP-Base-MTU",
 		"X-CSTP-DPD",
 		"X-CSTP-Keepalive",
+		"X-CSTP-Idle-Timeout",
+		"X-CSTP-Session-Timeout",
+		"X-CSTP-Disconnected-Timeout",
+		"X-CSTP-Keep",
+		"X-CSTP-TCP-Keepalive",
+		"X-CSTP-Tunnel-All-DNS",
+		"X-CSTP-Client-Bypass-Protocol",
+		"X-CSTP-Rekey-Time",
+		"X-CSTP-Rekey-Method",
+		"X-CSTP-License",
+		"X-CSTP-DynDNS",
+		"X-CSTP-Smartcard-Removal-Disconnect",
 	}
 	emitted := make(map[string]bool, len(well))
 	for _, k := range well {
@@ -413,6 +592,10 @@ func connectWireHeaderKey(k string) string {
 		return "X-CSTP-Split-Include"
 	case "X-Cstp-Split-Include-Ip6":
 		return "X-CSTP-Split-Include-IP6"
+	case "X-Cstp-Split-Exclude":
+		return "X-CSTP-Split-Exclude"
+	case "X-Cstp-Split-Exclude-Ip6":
+		return "X-CSTP-Split-Exclude-IP6"
 	default:
 		return k
 	}

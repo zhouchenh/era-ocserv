@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -216,6 +218,7 @@ func (t *Tunnel) readLoop() {
 			return
 		}
 		t.lastInbound.Store(t.now().UnixNano())
+		slog.Debug("cstp frame in", "device", t.identity.DeviceID, "type", typ, "len", n)
 
 		switch typ {
 		case pktData:
@@ -242,6 +245,12 @@ func (t *Tunnel) readLoop() {
 		case pktKeepalive:
 			// Same; updating lastInbound suffices.
 		case pktDisconnect:
+			// TEMP DIAGNOSTIC: AnyConnect puts a reason string in the
+			// AC_PKT_DISCONN payload; surface it so we can see why a strict
+			// iOS client tears the tunnel down right after CONNECT.
+			slog.Info("cstp client disconnect frame",
+				"device", t.identity.DeviceID, "len", n,
+				"payload", string(buf[:n]), "hex", fmt.Sprintf("%x", buf[:n]))
 			_ = t.closeWithErr(errClientDisconnect)
 			return
 		case pktTermServer:
@@ -258,20 +267,30 @@ func (t *Tunnel) readLoop() {
 	}
 }
 
-// heartbeatLoop fires DPD requests when the inbound channel is silent
-// and keepalive frames when the outbound channel has been silent
-// without data of its own. Granularity is the smaller of the two
-// intervals, floored at 1s.
+// heartbeatLoop drives server-initiated liveness on the CSTP channel.
+//
+// A strict AnyConnect client (Cisco Secure Client) waits to RECEIVE server
+// traffic soon after CONNECT to confirm the gateway is reachable both ways
+// before it commits to sending its own data; if it sees only silence it
+// declares "the secure gateway has rejected the connection" at ~20 s even
+// though the data plane is fine. Stock ocserv avoids this because its clients
+// drive DPD over DTLS — but on the facade-fronted CSTP path the client does
+// NOT initiate DPD, so era-ocserv must. We send a DPD-request whenever our
+// outbound channel has been idle for the heartbeat interval (a quarter of the
+// keepalive window, ~5 s), which lands the first probe well before the
+// client's ~20 s establishment deadline and keeps a recent liveness witness in
+// front of the client whenever we have no data of our own to send. The client
+// answers each DPD with a DPD-resp, which also keeps our inbound liveness fresh.
 func (t *Tunnel) heartbeatLoop() {
-	tick := t.dpdInterval
-	if t.keepaliveInterval > 0 && t.keepaliveInterval < tick {
-		tick = t.keepaliveInterval
+	hb := t.keepaliveInterval / 4
+	if t.dpdInterval > 0 && t.dpdInterval/4 < hb {
+		hb = t.dpdInterval / 4
 	}
-	if tick <= 0 {
-		tick = time.Second
+	if hb < 2*time.Second {
+		hb = 2 * time.Second
 	}
 
-	ticker := time.NewTicker(tick / 2)
+	ticker := time.NewTicker(hb)
 	defer ticker.Stop()
 
 	var dpdSeq uint32
@@ -291,11 +310,10 @@ func (t *Tunnel) heartbeatLoop() {
 				return
 			}
 
-			// DPD if inbound has been silent for a full interval.
-			if t.dpdInterval > 0 && now.Sub(lastIn) >= t.dpdInterval {
-				// Eight-byte opaque payload: high four bytes are a
-				// monotonic counter so we can correlate responses in
-				// logs if we ever need to.
+			// Server-initiated DPD when our outbound channel has been idle.
+			// Eight-byte opaque payload: high four bytes are a monotonic
+			// counter so DPD responses can be correlated in logs.
+			if now.Sub(lastOut) >= hb {
 				dpdSeq++
 				payload := []byte{
 					byte(dpdSeq >> 24), byte(dpdSeq >> 16),
@@ -303,16 +321,6 @@ func (t *Tunnel) heartbeatLoop() {
 					'D', 'P', 'D', '!',
 				}
 				if err := t.writeFrame(pktDPDOut, payload); err != nil {
-					_ = t.closeWithErr(err)
-					return
-				}
-				continue
-			}
-
-			// Keepalive when outbound has been silent but we have not
-			// just fired a DPD. Zero-length payload.
-			if t.keepaliveInterval > 0 && now.Sub(lastOut) >= t.keepaliveInterval {
-				if err := t.writeFrame(pktKeepalive, nil); err != nil {
 					_ = t.closeWithErr(err)
 					return
 				}
@@ -349,6 +357,7 @@ func (t *Tunnel) writeFrame(typ byte, payload []byte) error {
 	if len(payload) > maxFramePayload {
 		return errFrameTooLarge
 	}
+	slog.Debug("cstp frame out", "device", t.identity.DeviceID, "type", typ, "len", len(payload))
 
 	// Local scratch so concurrent calls don't share state.
 	buf := make([]byte, frameHeaderLen+len(payload))

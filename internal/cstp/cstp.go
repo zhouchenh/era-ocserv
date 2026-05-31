@@ -129,6 +129,14 @@ type Config struct {
 	// refreshes its DTLS binding in the background so the facade-side 5-minute
 	// binding TTL stays alive as long as the CSTP leg does.
 	DTLSBindingRefreshInterval time.Duration
+
+	// DTLSDisabled, when true, suppresses ALL DTLS advertisement in the CONNECT
+	// response (no binding publish, no X-DTLS-* headers) so the client carries
+	// its data plane over CSTP/TLS (TCP) only. Diagnostic/fallback switch for
+	// paths where the DTLS-over-UDP leg cannot round-trip (e.g. a public-edge
+	// UDP NAT that drops the return datagrams). CSTP keepalive/DPD still drive
+	// liveness.
+	DTLSDisabled bool
 }
 
 // Server is an http.Handler that drives the CSTP phase-2 XML

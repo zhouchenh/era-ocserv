@@ -89,11 +89,14 @@ func (a *activeClient) translator() *clatxlat.Translator {
 	return a.xlat
 }
 
-// placeholderClatV4 is the universal AnyConnect inner source IPv4 advertised
-// to every client via X-CSTP-Address (192.0.0.1, ADR 0035). The SIIT engine
-// maps it to/from the device's CLAT-source /128. RFC 7335 reserves
-// 192.0.0.0/29 for exactly this 464XLAT client purpose.
-var placeholderClatV4 = netip.MustParseAddr("192.0.0.1")
+// placeholderClatV4 is the universal AnyConnect inner source IPv4. The SIIT
+// engine maps it to/from the device's CLAT-source /128. It is the SAME value
+// advertised on the wire as X-CSTP-Address (cstp.ClatPlaceholderV4) so the
+// client's inner v4 source and the translator's expected source can never
+// drift. NOTE: it is intentionally NOT 192.0.0.1 — that collides with the iOS
+// system CLAT address on 464XLAT carriers and makes the client reassert; see
+// cstp.ClatPlaceholderV4 / emitCSTPHeaders.
+var placeholderClatV4 = cstp.ClatPlaceholderV4
 
 type bridge struct {
 	dev       *tun.Device
@@ -268,10 +271,27 @@ func (b *bridge) pumpTunnel(ctx context.Context, t *cstp.Tunnel) {
 	ac.mu.Lock()
 	prev := ac.cstp
 	ac.cstp = t
+	// A fresh CSTP CONNECT supersedes any DTLS session bound to this /128:
+	// AnyConnect only establishes DTLS *after* a CONNECT (the PSK comes from
+	// the CONNECT response), so any DTLS present at connect time belongs to a
+	// PRIOR client session and is stale. Leaving it would make chooseTransport
+	// (DTLS-preferred) ship this client's downloads into the dead session —
+	// e.g. an iPhone that had DTLS then reconnects CSTP-only (WiFi->5G where
+	// UDP :443 is blocked), or a stale openconnect session on the same device
+	// /128. Clear it so egress falls to this CSTP tunnel; the client re-admits
+	// its own DTLS via OnAdmit if/when its UDP leg comes up.
+	prevDTLS := ac.dtls
+	ac.dtls = nil
 	ac.mu.Unlock()
 	if prev != nil {
 		slog.Warn("displacing prior CSTP tunnel on same /128", "device", id.DeviceID, "inner", inner)
 		prev.Close()
+	}
+	if prevDTLS != nil {
+		// Detach from egress only; the dtlsuds listener's eviction walker
+		// reclaims the orphaned session (it will fail DPD / idle out). It can
+		// no longer steal this client's downloads the moment we clear it here.
+		slog.Warn("detaching stale DTLS session on fresh CSTP connect", "device", id.DeviceID, "inner", inner)
 	}
 	// Build the per-session translator + CLAT /128 key (no-op without a
 	// CLAT /128 → today's v6-only behavior).

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"github.com/zhouchenh/era-ocserv/internal/iam"
@@ -19,6 +20,15 @@ import (
 // DefaultSocketPath is the canonical AnyConnect-DTLS UDS socket path
 // (spec §2.1: `/var/run/era-facade/handoffs/anyconnect-dtls.sock`).
 const DefaultSocketPath = udshandoff.SocketRoot + "/anyconnect-dtls.sock"
+
+// DefaultHeartbeatInterval is how often the listener proactively sends a DTLS
+// DPD-request to every active session. The AnyConnect client declares the
+// gateway dead if it receives NO server traffic within its DPD/keepalive
+// window (advertised X-DTLS-Keepalive=20 / X-DTLS-DPD=30). A real Cisco client
+// with no app traffic of its own relies entirely on this server-initiated
+// liveness — without it the tunnel collapses at ~20 s ("gateway rejected").
+// 10 s keeps a witness well inside the client's window with ample margin.
+const DefaultHeartbeatInterval = 10 * time.Second
 
 // PacketSink is the bridge-side interface the DTLS listener calls to inject
 // inbound L3 plaintext into the host TUN device. era-ocserv supplies a
@@ -118,6 +128,13 @@ type Options struct {
 	// ResolveTimeout caps how long iam.Resolver.Resolve may block when
 	// admitting a new session. Zero ⇒ 2 s.
 	ResolveTimeout time.Duration
+
+	// HeartbeatInterval is the cadence at which the listener proactively
+	// sends a DTLS DPD-request to every active session so the AnyConnect
+	// client always has a recent server-liveness witness. Zero ⇒
+	// DefaultHeartbeatInterval (10 s). A negative value disables the
+	// heartbeat (used by tests that drive liveness deterministically).
+	HeartbeatInterval time.Duration
 }
 
 // Listener is the AnyConnect-DTLS UDS DGRAM consumer. One Listener owns
@@ -138,6 +155,15 @@ type Listener struct {
 	// the supplied Sink only implements the plain PacketSink. Cached at
 	// construction so the hot data path avoids a per-packet type assertion.
 	sessionSink SessionPacketSink
+
+	// heartbeat machinery: a goroutine that periodically sends a DTLS
+	// DPD-request to every active session. heartbeatStop/heartbeatDone
+	// coordinate shutdown; dpdSeq is a monotonic correlator placed in the
+	// DPD payload (mirrors the CSTP heartbeat).
+	heartbeatInterval time.Duration
+	heartbeatStop     chan struct{}
+	heartbeatDone     chan struct{}
+	dpdSeq            atomic.Uint32
 }
 
 // Listen binds the UDS socket, starts the session table eviction loop,
@@ -158,6 +184,9 @@ func Listen(ctx context.Context, opts Options) (*Listener, error) {
 	}
 	if opts.ResolveTimeout <= 0 {
 		opts.ResolveTimeout = 2 * time.Second
+	}
+	if opts.HeartbeatInterval == 0 {
+		opts.HeartbeatInterval = DefaultHeartbeatInterval
 	}
 	if opts.Lifecycle == nil {
 		opts.Lifecycle = noopLifecycle{}
@@ -212,12 +241,61 @@ func Listen(ctx context.Context, opts Options) (*Listener, error) {
 	}
 	l.uds = uds
 
+	// Proactive DTLS liveness: a real AnyConnect client with no app traffic
+	// of its own relies on server-initiated DPD to stay up. Start the
+	// heartbeat unless explicitly disabled (negative interval, for tests).
+	if opts.HeartbeatInterval > 0 {
+		l.heartbeatInterval = opts.HeartbeatInterval
+		l.heartbeatStop = make(chan struct{})
+		l.heartbeatDone = make(chan struct{})
+		go l.heartbeatLoop()
+	}
+
 	l.logger.Info("dtlsuds: listening",
 		slog.String("socket", opts.SocketPath),
 		slog.String("protocol", string(spec.Name)),
 		slog.Duration("idle_timeout", l.table.idleTimeout),
+		slog.Duration("heartbeat", l.heartbeatInterval),
 	)
 	return l, nil
+}
+
+// heartbeatLoop periodically sends a DTLS DPD-request to every active session
+// so an idle AnyConnect client always has a recent server-liveness witness.
+// The client answers with a DPD-response (handled in forwardPacket) and, more
+// importantly, resets its own "gateway is alive" timer on receipt — without
+// this the client tears the tunnel down at ~20 s when it has no traffic of its
+// own to elicit a reply. Mirrors the CSTP heartbeat (internal/cstp/tunnel.go)
+// for the DTLS data channel, which previously had no proactive liveness.
+func (l *Listener) heartbeatLoop() {
+	defer close(l.heartbeatDone)
+	ticker := time.NewTicker(l.heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-l.heartbeatStop:
+			return
+		case <-ticker.C:
+			for _, s := range l.table.Snapshot() {
+				seq := l.dpdSeq.Add(1)
+				payload := []byte{
+					byte(seq >> 24), byte(seq >> 16),
+					byte(seq >> 8), byte(seq),
+					'D', 'P', 'D', '!',
+				}
+				if err := l.replyAnyConnect(s, pktDPDOut, payload); err != nil {
+					// Session evicted mid-sweep (ErrSessionGone) or a
+					// transient write error; skip and continue the sweep.
+					continue
+				}
+				l.logger.Debug("dtls dpd sent",
+					slog.String("device_id", s.deviceID),
+					slog.String("four_tuple", s.key.String()),
+					slog.Uint64("seq", uint64(seq)),
+				)
+			}
+		}
+	}
 }
 
 // SocketPath returns the path the listener bound to. Useful for tests.
@@ -236,6 +314,11 @@ func (l *Listener) RunEvictionPass() { l.table.runEvictionPass() }
 // OnEvict for each), and removes the socket file. Idempotent.
 func (l *Listener) Close() error {
 	var firstErr error
+	if l.heartbeatStop != nil {
+		close(l.heartbeatStop)
+		<-l.heartbeatDone
+		l.heartbeatStop = nil
+	}
 	if l.uds != nil {
 		if err := l.uds.Close(); err != nil {
 			firstErr = err
@@ -378,9 +461,14 @@ func (l *Listener) forwardPacket(s *Session, acc *udshandoff.AcceptedDatagram) e
 		// Echo the opaque payload back as DPD-resp so the client sees a
 		// liveness witness. WritePacket prepends the AnyConnect type byte
 		// internally so we hand it the bare body.
+		l.logger.Debug("dtls dpd-req from client",
+			slog.String("device_id", s.deviceID), slog.String("four_tuple", s.key.String()))
 		return l.replyAnyConnect(s, pktDPDResp, body)
 	case pktDPDResp, pktKeepalive:
-		// lastSeen already touched by the caller; nothing more to do.
+		// lastSeen already touched by the caller; nothing more to do. Logged
+		// so we can confirm the client answers our server-initiated DPD.
+		l.logger.Debug("dtls liveness from client",
+			slog.String("device_id", s.deviceID), slog.Int("type", int(typ)))
 		return nil
 	case pktDisconnect:
 		l.logger.Info("dtls disconnect received",
