@@ -96,6 +96,18 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if !s.cfg.DTLSDisabled {
 		if s.cfg.DTLSBindingInstaller != nil && s.cfg.DTLSBindingSource != nil {
 			if binding, ok := s.cfg.DTLSBindingSource(r, id); ok {
+				// The facade routes the absolute AnyConnect CONNECT via its
+				// control handler with a SENTINEL handoff (all-zero token, stub
+				// source-v6) because it has no device identity there — era-ocserv
+				// resolves the real device from the webvpn cookie. Re-derive the
+				// binding identity from the authenticated session: the facade's
+				// BindingStore.Upsert REJECTS an all-zero token (400 -> DTLS
+				// silently skipped, client stays on TCP), and the source-v6 must
+				// be the device's real inner /128 rather than the stub.
+				binding.Token = sessionBindingToken(sess.token)
+				if a := id.IPv6.Addr(); a.IsValid() {
+					binding.SourceV6 = a
+				}
 				if secret, err := issueDTLSSecret(s.cfg.RandRead); err == nil {
 					binding.PSK = secret
 					address := dtlsAddressForRequest(r, s.cfg)
@@ -173,6 +185,20 @@ func issueDTLSSecret(randRead func(p []byte) (int, error)) ([32]byte, error) {
 	var secret [32]byte
 	_, err := randRead(secret[:])
 	return secret, err
+}
+
+// sessionBindingToken derives a stable, non-zero 12-byte token for the
+// shared-edge DTLS binding from the authenticated webvpn session cookie. The
+// real 12-byte ERA apex token only rides the per-device auth handoff, not the
+// facade's sentinel CONNECT handoff, but the facade's BindingStore.Upsert
+// rejects an all-zero token. This value is non-zero and per-session-stable
+// (so binding refreshes are idempotent); the binding's security is the
+// source-IP gate plus the random PSK — the token field is identity/audit only.
+func sessionBindingToken(cookie string) [12]byte {
+	var t [12]byte
+	sum := sha256.Sum256([]byte(cookie))
+	copy(t[:], sum[:12])
+	return t
 }
 
 // extractWebVPNCookie pulls the AnyConnect session cookie out of the
