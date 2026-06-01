@@ -19,6 +19,31 @@
 # TCP handshake completes but the first full-size data segment blackholes.
 set -eu
 
+# --- Outer AnyConnect MSS clamp (covert :443 path) ---------------------------
+# The iOS AnyConnect client reaches the covert apex over an OUTER TCP/TLS to
+# :443, and that single CSTP/TLS stream carries ALL tunnel data — so on a lossy
+# 5G link it is MSS-bound (Mathis: throughput ~ MSS/(RTT*sqrt(loss))). The rule
+# was originally an over-conservative MSS 900; raising it to 1200 measured ~+40%
+# and, combined with BBR, took a real iPhone 5G run from 6.3 -> 24.5 Mbps,
+# validated safe under 466 MB of load (path PMTU 1500, zero black-hole). 1200 ->
+# ~1260 B packet stays under the IPv6 1280 floor so any v6 path carries it, and
+# PMTUD lowers it further on smaller paths. Lives in its own `inet era_mss`
+# table, created here if absent (it is NOT in /etc/nftables.conf, which flushes
+# the ruleset on load). Runs BEFORE the era_nat64 early-exit so the outer clamp
+# is ensured even on a host where the WG/CLAT table is absent.
+OUTER_TABLE="inet era_mss"
+OUTER_CHAIN="prerouting"
+OUTER_TAG="era-ac-outer-mss"
+OUTER_MSS="1200"
+nft add table $OUTER_TABLE 2>/dev/null || true
+nft add chain $OUTER_TABLE $OUTER_CHAIN '{ type filter hook prerouting priority mangle; policy accept; }' 2>/dev/null || true
+nft -a list chain $OUTER_TABLE $OUTER_CHAIN 2>/dev/null \
+  | grep "comment \"$OUTER_TAG\"" \
+  | grep -oE 'handle [0-9]+' | awk '{print $2}' \
+  | while read -r h; do nft delete rule $OUTER_TABLE $OUTER_CHAIN handle "$h"; done
+nft add rule $OUTER_TABLE $OUTER_CHAIN tcp dport 443 tcp flags syn counter tcp option maxseg size set $OUTER_MSS comment "$OUTER_TAG"
+echo "era-ocserv-mss-clamp: outer :443 MSS clamp ensured ($OUTER_MSS)"
+
 TABLE="inet era_nat64"
 CHAIN="forward"
 TAG="era-ocserv-clat"
