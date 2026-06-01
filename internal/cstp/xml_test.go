@@ -56,7 +56,7 @@ func TestParseRejectsNonRoot(t *testing.T) {
 }
 
 func TestBuildAuthRequestRoundTrip(t *testing.T) {
-	body, err := buildUsernameRequest("OPAQUE-ID-XYZ", "Please enter your username.")
+	body, err := buildUsernameRequest("OPAQUE-ID-XYZ", "Please enter your username.", "/auth")
 	if err != nil {
 		t.Fatalf("buildUsernameRequest: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestBuildAuthRequestRoundTrip(t *testing.T) {
 	if strings.Contains(s, `name="password"`) {
 		t.Fatalf("step-1 form must NOT carry a password input (2-step): %s", s)
 	}
-	pw, err := buildPasswordRequest("OPAQUE-ID-XYZ", "Please enter your password.")
+	pw, err := buildPasswordRequest("OPAQUE-ID-XYZ", "Please enter your password.", "/auth")
 	if err != nil {
 		t.Fatalf("buildPasswordRequest: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestBuildAuthCompleteRoundTrip(t *testing.T) {
 func TestBuildAuthErrorIncludesPromptAndForm(t *testing.T) {
 	// On a verification failure we re-prompt the password step with the error
 	// message (the username is already stashed for the 2-step flow).
-	body, err := buildPasswordRequest("X", "Sign-in failed.")
+	body, err := buildPasswordRequest("X", "Sign-in failed.", "/auth")
 	if err != nil {
 		t.Fatalf("buildPasswordRequest: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestBuildAuthErrorIncludesPromptAndForm(t *testing.T) {
 // TestBuildParseRoundTripAuthRequest exercises the wire shape end-to-end:
 // the server-side build is parsed back through the client-side decoder.
 func TestBuildParseRoundTripAuthRequest(t *testing.T) {
-	body, err := buildUsernameRequest("OPAQUE-1", "Please enter your username.")
+	body, err := buildUsernameRequest("OPAQUE-1", "Please enter your username.", "/auth")
 	if err != nil {
 		t.Fatalf("buildUsernameRequest: %v", err)
 	}

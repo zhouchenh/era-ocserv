@@ -2,6 +2,7 @@ package cstp
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -91,13 +92,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// matches. Absolute follow-ups (/auth form action, /CSCOSSLC/tunnel) carry no
 	// prefix and are unaffected.
 	if strings.HasPrefix(r.URL.Path, "/drive/access/") {
-		rest := r.URL.Path[len("/drive/access/"):]
+		full := r.URL.Path
+		rest := full[len("/drive/access/"):]
+		var groupURL string
 		if i := strings.IndexByte(rest, '/'); i >= 0 {
+			groupURL = full[:len("/drive/access/")+i] // /drive/access/<token>
 			r.URL.Path = rest[i:]
 		} else {
+			groupURL = full // /drive/access/<token> (bare group-url)
 			r.URL.Path = "/"
 		}
-		slog.Debug("cstp group-url prefix stripped", "routed_path", r.URL.Path)
+		// The client must address ALL post-auth follow-ups UNDER the group-url so
+		// the facade apex matches them (and recovers the device token): the auth
+		// form action (/drive/access/<token>/auth) AND the tunnel CONNECT +
+		// housekeeping, which the client builds from the webvpnc `bu:` base. An
+		// absolute path would skip the apex and hit the cover. Stash the group-url
+		// so the form builder + webvpnc directive can prefix accordingly.
+		r = r.WithContext(context.WithValue(r.Context(), groupURLCtxKey{}, groupURL))
+		slog.Debug("cstp group-url prefix stripped", "routed_path", r.URL.Path, "group_url", groupURL)
 	}
 	if ua := r.Header.Get("User-Agent"); rejectAndroidCiscoSC(ua) {
 		http.Error(w, "Cisco Secure Client on Android is not supported; use OpenConnect for Android.", http.StatusForbidden)
@@ -119,6 +131,40 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("cstp request UNROUTED -> 404", "method", r.Method, "path", r.URL.Path)
 		http.NotFound(w, r)
 	}
+}
+
+// groupURLCtxKey keys the covert group-url prefix (e.g. "/drive/access/<token>")
+// stashed by ServeHTTP onto the request context. Empty/absent => standalone.
+type groupURLCtxKey struct{}
+
+// groupURLFor returns the covert group-url prefix captured by ServeHTTP, or ""
+// when the request did not arrive under a /drive/access/<token> path.
+func groupURLFor(r *http.Request) string {
+	if v, ok := r.Context().Value(groupURLCtxKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// authActionFor returns the POST target the auth-request forms must advertise.
+// Behind the facade it is the group-url-prefixed "/drive/access/<token>/auth";
+// standalone (no group-url) it defaults to the bare "/auth" stock ocserv uses.
+func authActionFor(r *http.Request) string {
+	if g := groupURLFor(r); g != "" {
+		return g + "/auth"
+	}
+	return "/auth"
+}
+
+// webVPNCBaseFor returns the webvpnc `bu:` base URL — what the client resolves
+// the tunnel CONNECT + housekeeping GETs against. Behind the facade it is the
+// group-url with a trailing slash ("/drive/access/<token>/") so the client
+// prefixes the CONNECT under the token; standalone it defaults to "/".
+func webVPNCBaseFor(r *http.Request) string {
+	if g := groupURLFor(r); g != "" {
+		return g + "/"
+	}
+	return "/"
 }
 
 // handleInit answers phase 2a: an init POST. We mint a fresh opaque
@@ -144,7 +190,7 @@ func (s *Server) handleInit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal", http.StatusInternalServerError)
 		return
 	}
-	body, err := buildUsernameRequest(sess.opaqueID, "Please enter your username.")
+	body, err := buildUsernameRequest(sess.opaqueID, "Please enter your username.", authActionFor(r))
 	if err != nil {
 		http.Error(w, "internal", http.StatusInternalServerError)
 		return
@@ -207,7 +253,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 			}
 			s.sessions.stashUsername(opaqueID, pa.Username)
 			setWebVPNContext(w, opaqueID)
-			body, _ := buildPasswordRequest(opaqueID, "Please enter your password.")
+			body, _ := buildPasswordRequest(opaqueID, "Please enter your password.", authActionFor(r))
 			writeAuthXML(w, http.StatusOK, body)
 			return
 		}
@@ -218,7 +264,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		setWebVPNContext(w, fresh.opaqueID)
-		body, _ := buildUsernameRequest(fresh.opaqueID, "Please enter your username.")
+		body, _ := buildUsernameRequest(fresh.opaqueID, "Please enter your username.", authActionFor(r))
 		writeAuthXML(w, http.StatusOK, body)
 		return
 	}
@@ -227,14 +273,14 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	username := sess.username
 	if pa.Password == "" {
 		setWebVPNContext(w, opaqueID)
-		body, _ := buildPasswordRequest(opaqueID, "Please enter your password.")
+		body, _ := buildPasswordRequest(opaqueID, "Please enter your password.", authActionFor(r))
 		writeAuthXML(w, http.StatusOK, body)
 		return
 	}
 	deviceID, verr := s.cfg.Verifier.Verify(r.Context(), username, pa.Password)
 	if verr != nil {
 		setWebVPNContext(w, opaqueID)
-		body, _ := buildPasswordRequest(opaqueID, "Sign-in failed. Please try again.")
+		body, _ := buildPasswordRequest(opaqueID, "Sign-in failed. Please try again.", authActionFor(r))
 		writeAuthXML(w, http.StatusOK, body)
 		return
 	}
@@ -266,7 +312,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	// directive with a 1970-expiry Set-Cookie before writing the new one; we
 	// mirror that so a reconnect never carries a stale directive.
 	w.Header().Add("Set-Cookie", "webvpnc=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; Secure; HttpOnly")
-	w.Header().Add("Set-Cookie", "webvpnc="+s.webvpnc+"; path=/; Secure; HttpOnly")
+	w.Header().Add("Set-Cookie", "webvpnc="+buildWebVPNC(webVPNCBaseFor(r), s.certSHA1)+"; path=/; Secure; HttpOnly")
 	body, err := buildAuthComplete()
 	if err != nil {
 		http.Error(w, "internal", http.StatusInternalServerError)

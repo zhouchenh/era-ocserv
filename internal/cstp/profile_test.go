@@ -9,7 +9,7 @@ import (
 // directive shape and pins the supplied SHA-1 in the sh: field.
 func TestBuildWebVPNC(t *testing.T) {
 	const certSHA1 = "AABBCCDDEEFF00112233445566778899AABBCCDD"
-	got := buildWebVPNC(certSHA1)
+	got := buildWebVPNC("/", certSHA1)
 	want := "bu:/&p:t&iu:1/&sh:" + certSHA1
 	if got != want {
 		t.Fatalf("buildWebVPNC = %q, want %q", got, want)
@@ -27,11 +27,11 @@ func TestServerWebVPNCOverride(t *testing.T) {
 	const override = "0123456789ABCDEF0123456789ABCDEF01234567"
 
 	got := NewServer(Config{ServerCertSHA1: override}).webvpnc
-	if want := buildWebVPNC(override); got != want {
+	if want := buildWebVPNC("/", override); got != want {
 		t.Fatalf("override webvpnc = %q, want %q", got, want)
 	}
 
-	wantDefault := buildWebVPNC(serverCertSHA1)
+	wantDefault := buildWebVPNC("/", serverCertSHA1)
 	for _, empty := range []string{"", "   "} {
 		got := NewServer(Config{ServerCertSHA1: empty}).webvpnc
 		if got != wantDefault {

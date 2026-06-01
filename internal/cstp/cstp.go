@@ -149,9 +149,12 @@ type Server struct {
 	cfg Config
 
 	// webvpnc is the precomputed value of the post-auth webvpnc directive cookie
-	// (see profile.go). It bakes in Config.ServerCertSHA1 (or the built-in
-	// default) once at construction so every complete response reuses it.
-	webvpnc string
+	// with the DEFAULT base URL ("/", standalone). The facade path rebuilds it
+	// per-request with the group-url base via buildWebVPNC(webVPNCBaseFor(r),
+	// certSHA1); see handleAuth. certSHA1 is kept so that rebuild needs no
+	// re-resolution.
+	webvpnc  string
+	certSHA1 string
 
 	sessions *sessionTable
 
@@ -176,7 +179,8 @@ func NewServer(cfg Config) *Server {
 	}
 	return &Server{
 		cfg:      cfg,
-		webvpnc:  buildWebVPNC(certSHA1),
+		webvpnc:  buildWebVPNC("/", certSHA1),
+		certSHA1: certSHA1,
 		sessions: newSessionTable(cfg.SessionTimeout, cfg.Now),
 		tunnels:  make(chan *Tunnel, 32),
 		closeCh:  make(chan struct{}),

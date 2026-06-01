@@ -132,7 +132,15 @@ func parseAuthRequest(r io.Reader) (parsedAuth, error) {
 // header just to pass the form, and afterwards refuses to send the CSTP CONNECT
 // even on a byte-for-byte stock-shaped complete). The single-input forms drive
 // the simple path that stock ocserv uses and that connects iOS end-to-end.
-func buildAuthForm(opaqueID, message string, inputs []authFormItem) ([]byte, error) {
+// action is the form POST target. Standalone listeners use "/auth"; behind the
+// era-facade covert apex the client must POST follow-ups UNDER the group-url
+// (`/drive/access/<token>/auth`) so the facade can match the route + recover the
+// device token — an absolute "/auth" would miss the apex and hit the cover. The
+// caller derives the right value from the request path (see authActionFor).
+func buildAuthForm(opaqueID, message, action string, inputs []authFormItem) ([]byte, error) {
+	if action == "" {
+		action = "/auth"
+	}
 	env := authEnvelope{
 		Client: "vpn",
 		Type:   authTypeAuthRequest,
@@ -145,7 +153,7 @@ func buildAuthForm(opaqueID, message string, inputs []authFormItem) ([]byte, err
 			ID:      "main",
 			Message: message,
 			Form: &authForm{
-				Action: "/auth",
+				Action: action,
 				Method: "post",
 				Inputs: inputs,
 			},
@@ -155,15 +163,15 @@ func buildAuthForm(opaqueID, message string, inputs []authFormItem) ([]byte, err
 }
 
 // buildUsernameRequest renders the step-1 auth-request (username-only form).
-func buildUsernameRequest(opaqueID, message string) ([]byte, error) {
-	return buildAuthForm(opaqueID, message, []authFormItem{
+func buildUsernameRequest(opaqueID, message, action string) ([]byte, error) {
+	return buildAuthForm(opaqueID, message, action, []authFormItem{
 		{Label: "Username:", Name: "username", Type: "text"},
 	})
 }
 
 // buildPasswordRequest renders the step-2 auth-request (password-only form).
-func buildPasswordRequest(opaqueID, message string) ([]byte, error) {
-	return buildAuthForm(opaqueID, message, []authFormItem{
+func buildPasswordRequest(opaqueID, message, action string) ([]byte, error) {
+	return buildAuthForm(opaqueID, message, action, []authFormItem{
 		{Label: "Password:", Name: "password", Type: "password"},
 	})
 }

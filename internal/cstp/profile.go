@@ -59,6 +59,14 @@ const serverCertSHA1 = "525FB9D7A730F41527C4F85394454E716B389997"
 //
 //	bu: base URL · p:t protocol=tunnel · iu: install URL · sh: gateway cert hash
 //
+// baseURL is the `bu:` field — the base the client resolves all post-auth
+// requests against, INCLUDING the tunnel `CONNECT <bu>CSCOSSLC/tunnel` and the
+// relative `iu:` housekeeping GET. Standalone listeners use "/"; behind the
+// era-facade covert apex it MUST be the group-url ("/drive/access/<token>/") so
+// the client prefixes the CONNECT (and housekeeping) under the token — an
+// absolute "/CSCOSSLC/tunnel" would miss the apex and hit the cover, which the
+// iOS client reports as "VPN configuration ... is invalid".
+//
 // certSHA1 is the uppercase-hex SHA-1 of the public TLS leaf cert (the sh: pin).
 // This is EXACTLY stock ocserv's directive when no client profile is configured
 // — and a side-by-side capture against the iOS Cisco Secure Client proved that
@@ -70,8 +78,11 @@ const serverCertSHA1 = "525FB9D7A730F41527C4F85394454E716B389997"
 // the CONNECT. Stock ships none of them and works; we match stock. The value is
 // sent verbatim (its &/:/% are literal — do NOT use http.SetCookie, which would
 // percent-escape them).
-func buildWebVPNC(certSHA1 string) string {
-	return "bu:/&p:t&iu:1/&sh:" + certSHA1
+func buildWebVPNC(baseURL, certSHA1 string) string {
+	if baseURL == "" {
+		baseURL = "/"
+	}
+	return "bu:" + baseURL + "&p:t&iu:1/&sh:" + certSHA1
 }
 
 // AnyConnect post-auth "housekeeping" response bodies the client GETs between
