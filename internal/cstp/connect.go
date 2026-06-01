@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -94,29 +95,36 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if !s.cfg.DTLSDisabled {
 		if s.cfg.DTLSBindingInstaller != nil && s.cfg.DTLSBindingSource != nil {
 			if binding, ok := s.cfg.DTLSBindingSource(r, id); ok {
-				// The facade routes the absolute AnyConnect CONNECT via its
-				// control handler with a SENTINEL handoff (all-zero token, stub
-				// source-v6); era-ocserv resolves the real device from the webvpn
-				// cookie. Re-derive identity from the authenticated session: the
-				// facade BindingStore.Upsert rejects an all-zero token, and the
-				// source-v6 must be the device's real inner /128.
+				// The facade routes the absolute AnyConnect CONNECT via its control
+				// handler with a SENTINEL handoff (all-zero token, stub source-v6);
+				// re-derive identity from the authenticated session (the facade
+				// BindingStore rejects an all-zero token; source-v6 must be the
+				// device's real inner /128).
 				binding.Token = sessionBindingToken(sess.token)
 				if a := id.IPv6.Addr(); a.IsValid() {
 					binding.SourceV6 = a
 				}
-				// STEP 2 TODO: the real DTLS PSK is the OUTER-TLS RFC5705 exporter
-				// ("EXPORTER-openconnect-psk", 32B), which ONLY the facade can
-				// compute (it terminates the client TLS) and must forward via
-				// ERA_TLV_DTLS_PSK. Until that lands, the binding carries a
-				// locally-generated secret that will NOT match the client's
-				// exporter PSK — so the (now correctly-advertised, ocserv-shaped)
-				// DTLS handshake fails after the ClientHello and the client stays
-				// on TCP. The header fix alone proves the client now ATTEMPTS DTLS.
-				if secret, err := issueDTLSSecret(s.cfg.RandRead); err == nil {
-					binding.PSK = secret
-					if err := s.cfg.DTLSBindingInstaller.Upsert(r.Context(), binding); err == nil {
-						if appID, aerr := randHex(nil, 32); aerr == nil {
-							emitDTLSHeaders(headers, appID)
+				// Cisco AnyConnect / iOS DTLS uses LEGACY injected-premaster
+				// RESUMPTION (NOT PSK-NEGOTIATE, which iOS never offers): the client
+				// supplies a 48-byte master secret in the CONNECT request; we echo a
+				// 32-byte Session-ID + a real cipher; the facade's pion dtls.Server
+				// resumes the DTLS session with that master secret (via a SessionStore
+				// == gnutls_session_set_premaster). Publish all three to the binding so
+				// the facade can drive the abbreviated handshake.
+				master, mok := parseClientMasterSecret(r)
+				ocName, cok := selectDTLSCipher(r)
+				if mok && cok {
+					rr := s.cfg.RandRead
+					if rr == nil {
+						rr = rand.Read
+					}
+					var sid [32]byte
+					if _, rerr := rr(sid[:]); rerr == nil {
+						binding.DTLSMasterSecret = master
+						binding.DTLSSessionID = sid
+						binding.DTLSCipher = ocName
+						if err := s.cfg.DTLSBindingInstaller.Upsert(r.Context(), binding); err == nil {
+							emitLegacyDTLSHeaders(headers, ocName, sid[:], innerMTU)
 							tunnelDTLS = &dtlsBindingState{
 								installer:       s.cfg.DTLSBindingInstaller,
 								binding:         binding,
@@ -124,17 +132,6 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 							}
 						}
 					}
-				}
-			}
-		}
-		if tunnelDTLS == nil {
-			// Legacy/standalone fallback (direct-TLS mode, r.TLS != nil): with no
-			// facade in front, era-ocserv terminates TLS itself and can derive the
-			// exporter PSK directly, so it advertises DTLS the same PSK-NEGOTIATE
-			// way. Behind the facade r.TLS == nil, so this never fires.
-			if _, dtlsOK := deriveDTLSSecret(r); dtlsOK {
-				if appID, err := randHex(nil, 32); err == nil {
-					emitDTLSHeaders(headers, appID)
 				}
 			}
 		}
@@ -173,15 +170,6 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		_ = t.Close()
 		return
 	}
-}
-
-func issueDTLSSecret(randRead func(p []byte) (int, error)) ([32]byte, error) {
-	if randRead == nil {
-		randRead = rand.Read
-	}
-	var secret [32]byte
-	_, err := randRead(secret[:])
-	return secret, err
 }
 
 // sessionBindingToken derives a stable, non-zero 12-byte token for the
@@ -432,44 +420,72 @@ func iosUserAgent(r *http.Request) bool {
 		strings.Contains(ua, "ipad") || strings.Contains(ua, "ios")
 }
 
-// emitDTLSHeaders advertises the DTLS PSK-NEGOTIATE channel to the
-// client. The DTLS implementation itself lives in a sibling package;
-// here we only emit the headers required for the client to attempt the
-// UDP handshake. The exporter-derived 32-byte secret is hex-encoded
-// per legacy convention (Cisco Secure Client accepts both hex and
-// base64; we pick hex to match openconnect / ocserv).
-// emitDTLSHeaders advertises the DTLS data channel EXACTLY as stock ocserv does
-// in PSK-NEGOTIATE mode (src/worker-vpn.c connect_handler) — verified by reading
-// the ocserv + openconnect source. The ONLY headers in PSK mode are
-// X-DTLS-CipherSuite: PSK-NEGOTIATE, X-DTLS-App-ID (the DTLS PSK identity), and
-// the port/keepalive/dpd/rekey knobs.
-//
-// It deliberately sends NO X-DTLS-Master-Secret, NO X-DTLS-Session-ID, NO
-// X-DTLS-MTU and NO X-DTLS-Address. Those belong ONLY to the legacy Cisco-DTLS
-// fake-resumption mode (which uses a real DTLS cipher name + a 48-byte
-// client-supplied master secret). Mixing a master secret with PSK-NEGOTIATE is a
-// malformed hybrid that no real ocserv produces; the iOS Cisco Secure Client
-// parses it, sizes its tun for the DTLS MTU, then sends ZERO DTLS ClientHello and
-// falls back to TCP. (That is exactly the bug the prior X-DTLS-MTU==X-CSTP-MTU
-// comment was working around — but the real cause was the bogus header set, not a
-// blocked UDP path.)
-//
-// The PSK is NOT transmitted: both ends derive it from the OUTER-TLS RFC5705
-// exporter "EXPORTER-openconnect-psk" (32 bytes). Behind the facade only the
-// facade holds the client TLS, so the facade derives + supplies it.
-//
-// appID is 64 lowercase hex chars (a 32-byte identifier) — the PSK identity the
-// client puts in its ClientHello; the server returns the exporter key regardless
-// of identity, so it is informational.
-func emitDTLSHeaders(h http.Header, appID string) {
-	h.Set("X-DTLS-CipherSuite", "PSK-NEGOTIATE")
-	h.Set("X-DTLS-App-ID", appID)
+// emitLegacyDTLSHeaders advertises Cisco AnyConnect's LEGACY DTLS — the mode the
+// iOS Cisco Secure Client actually speaks (it never offers PSK-NEGOTIATE). Stock
+// ocserv (src/worker-vpn.c, legacy branch) echoes a Session-ID + the chosen real
+// cipher; the client pre-seeded its DTLS session with the 48-byte master secret
+// it sent in X-Dtls-Master-Secret, so the handshake is an abbreviated resumption
+// (the facade's pion dtls.Server resumes it via a SessionStore == ocserv's
+// gnutls_session_set_premaster). We consume the client's master secret (do NOT
+// echo it) and never send PSK-NEGOTIATE / X-DTLS-App-ID. Header casing is fixed
+// on the wire by connectWireHeaderKey (iOS is case-sensitive). X-DTLS-MTU is set
+// == X-CSTP-MTU so iOS never tears down to reconfigure its tun.
+func emitLegacyDTLSHeaders(h http.Header, ocName string, sessionID []byte, mtu int) {
+	h.Set("X-DTLS-Session-ID", hex.EncodeToString(sessionID)) // 64 hex = 32 bytes
+	h.Set("X-DTLS12-CipherSuite", ocName)
+	h.Set("X-DTLS-MTU", strconv.Itoa(mtu)) // == X-CSTP-MTU so iOS never New-MTU-reconfigures
 	h.Set("X-DTLS-Port", "443")
 	h.Set("X-DTLS-Keepalive", "20")
 	h.Set("X-DTLS-DPD", "30")
-	// ocserv emits rekey_time + 10.
 	h.Set("X-DTLS-Rekey-Time", "28810")
-	h.Set("X-DTLS-Rekey-Method", "ssl")
+	// Go's TLS cannot renegotiate in place; rekey by reconnect (matches X-CSTP-Rekey-Method).
+	h.Set("X-DTLS-Rekey-Method", "new-tunnel")
+}
+
+// parseClientMasterSecret extracts the AnyConnect client's 48-byte DTLS master
+// secret from the X-Dtls-Master-Secret request header (96 hex chars). The client
+// generates it; the server consumes it as the resumed DTLS session's keying
+// material (it is NOT echoed back).
+func parseClientMasterSecret(r *http.Request) ([48]byte, bool) {
+	var ms [48]byte
+	v := strings.TrimSpace(r.Header.Get("X-Dtls-Master-Secret"))
+	if len(v) != 96 {
+		return ms, false
+	}
+	b, err := hex.DecodeString(v)
+	if err != nil || len(b) != 48 {
+		return ms, false
+	}
+	copy(ms[:], b)
+	return ms, true
+}
+
+// dtlsCipherPrefs is the server-preference-ordered set of DTLS 1.2 ciphers the
+// facade's pion dtls.Server can terminate (by ocserv oc_name). We prefer
+// ECDHE-RSA-AES128-GCM-SHA256 — offered by the iOS Cisco Secure Client and
+// shipped by pion (its ECDHE/cert part is vestigial on a resumed handshake).
+var dtlsCipherPrefs = []string{
+	"ECDHE-RSA-AES128-GCM-SHA256",
+	"ECDHE-RSA-AES256-GCM-SHA384",
+	"ECDHE-ECDSA-AES128-GCM-SHA256",
+	"ECDHE-ECDSA-AES256-GCM-SHA384",
+}
+
+// selectDTLSCipher picks the highest-preference cipher the client offered in its
+// X-Dtls12-Ciphersuite (DTLS 1.2) request header that the facade can terminate.
+func selectDTLSCipher(r *http.Request) (string, bool) {
+	offered := map[string]bool{}
+	for _, hv := range r.Header.Values("X-Dtls12-Ciphersuite") {
+		for _, tok := range strings.Split(hv, ":") {
+			offered[strings.TrimSpace(tok)] = true
+		}
+	}
+	for _, c := range dtlsCipherPrefs {
+		if offered[c] {
+			return c, true
+		}
+	}
+	return "", false
 }
 
 func dtlsAddressForRequest(r *http.Request, cfg Config) string {
@@ -483,23 +499,6 @@ func dtlsAddressForRequest(r *http.Request, cfg Config) string {
 		}
 	}
 	return strings.TrimSpace(cfg.ServerName)
-}
-
-// deriveDTLSSecret pulls a 32-byte PSK from the outer TLS session
-// using the RFC 5705 keying-material exporter. The label matches
-// ocserv's "EXPORTER-openconnect-psk" with empty context. If the
-// underlying http.Request was not served on a *tls.Conn that exposes
-// the exporter (e.g. unit tests using net.Pipe), we report ok=false
-// and the caller omits all X-DTLS-* headers.
-func deriveDTLSSecret(r *http.Request) ([]byte, bool) {
-	if r.TLS == nil {
-		return nil, false
-	}
-	mat, err := r.TLS.ExportKeyingMaterial("EXPORTER-openconnect-psk", nil, 32)
-	if err != nil {
-		return nil, false
-	}
-	return mat, true
 }
 
 // writeConnectResponse manually writes the 200 CONNECTED HTTP/1.1

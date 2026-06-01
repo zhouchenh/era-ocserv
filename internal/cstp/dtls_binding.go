@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -17,12 +18,21 @@ import (
 // facade so the shared-edge DTLS terminator can admit the matching UDP source.
 type DTLSBinding struct {
 	SourceIP      netip.Addr
-	PSK           [32]byte
+	PSK           [32]byte // legacy PSK-NEGOTIATE path; UNUSED for Cisco injected-premaster DTLS
 	DeviceID      string
 	UserID        string
 	MTLSSubjectDN string
 	SourceV6      netip.Addr
 	Token         [12]byte
+
+	// Cisco AnyConnect legacy DTLS (the mode iOS actually uses): the client
+	// sends a 48-byte master secret in the CONNECT request, the server echoes a
+	// 32-byte Session-ID + a real cipher, and the DTLS handshake is an
+	// abbreviated session-resumption keyed by that master secret (the facade's
+	// pion dtls.Server consumes these via a SessionStore == gnutls_session_set_premaster).
+	DTLSMasterSecret [48]byte // client-chosen, from X-Dtls-Master-Secret (96 hex -> 48B)
+	DTLSSessionID    [32]byte // server-chosen, echoed in X-DTLS-Session-ID
+	DTLSCipher       string   // chosen oc_name, e.g. "ECDHE-RSA-AES128-GCM-SHA256"
 }
 
 // DTLSBindingInstaller pushes CSTP-authenticated DTLS bindings to the facade.
@@ -71,13 +81,16 @@ func NewHTTPDTLSBindingInstaller(cfg HTTPDTLSBindingInstallerConfig) (*HTTPDTLSB
 
 func (i *HTTPDTLSBindingInstaller) Upsert(ctx context.Context, binding DTLSBinding) error {
 	reqBody := map[string]string{
-		"source_ip":       binding.SourceIP.Unmap().String(),
-		"dtls_psk":        base64.RawStdEncoding.EncodeToString(binding.PSK[:]),
-		"device_id":       binding.DeviceID,
-		"user_id":         binding.UserID,
-		"mtls_subject_dn": binding.MTLSSubjectDN,
-		"source_v6":       binding.SourceV6.String(),
-		"token":           base64.RawURLEncoding.EncodeToString(binding.Token[:]),
+		"source_ip":          binding.SourceIP.Unmap().String(),
+		"dtls_psk":           base64.RawStdEncoding.EncodeToString(binding.PSK[:]),
+		"device_id":          binding.DeviceID,
+		"user_id":            binding.UserID,
+		"mtls_subject_dn":    binding.MTLSSubjectDN,
+		"source_v6":          binding.SourceV6.String(),
+		"token":              base64.RawURLEncoding.EncodeToString(binding.Token[:]),
+		"dtls_master_secret": hex.EncodeToString(binding.DTLSMasterSecret[:]),
+		"dtls_session_id":    hex.EncodeToString(binding.DTLSSessionID[:]),
+		"dtls_cipher":        binding.DTLSCipher,
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
