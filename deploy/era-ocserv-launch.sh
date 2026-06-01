@@ -32,5 +32,14 @@ exec /usr/local/bin/era-ocserv \
   -tun-queues 0 \
   -tun-ipv6 2001:470:f9d1:9001:ffff::1/128 \
   -server-name eracloud.app \
-  -dns 2606:4700:4700::1111,2606:4700:4700::1001 \
+  -dns 2001:470:f9d1:6666::64 \
   -log-level debug
+#
+# -dns MUST be the DNS64 resolver (2001:470:f9d1:6666::64), NOT a plain v6
+# recursive resolver. The data plane is CLAT-only (464XLAT): the client has no
+# native v4 route, so every v4-only destination has to be reached as a
+# synthesized 64:ff9b::<v4> AAAA over the v6 tunnel. A non-DNS64 resolver (e.g.
+# Cloudflare 2606:4700:4700::1111) returns real A records the client cannot
+# route, so v4-only sites silently fail. The DNS64 resolver synthesizes the
+# 64:ff9b::/96 AAAAs the host NAT64 then translates. Keep this in lockstep with
+# the NAT64 prefix and the reconciler route.
