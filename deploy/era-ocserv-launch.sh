@@ -9,8 +9,17 @@
 #
 # The inner-v4 CLAT (SIIT) needs NO launch flag: each device's CLAT-source /128
 # arrives per-session from the tpm client-config (source_ipv6_ocserv_clat) via
-# the iam resolver. The host TUN stays MTU 1500; era-ocserv advertises the inner
-# MTU (1400) to the client itself.
+# the iam resolver.
+#
+# -tun-mtu 1300 (NOT 1500): the DTLS data plane sends each inner packet as ONE
+# DTLS-over-UDP datagram (no segmentation, unlike CSTP-over-TCP). At a 1500 tun
+# the encrypted datagram (~+66 B: IP+UDP+DTLS record+GCM tag) overran the ~1500
+# path MTU and AnyConnect dropped every large server->client frame (verified on a
+# real iPhone: data frames received ~0, control frames fine — a stuck tunnel).
+# 1300 keeps the wire datagram ~1366 B — safe on Wi-Fi (1500) AND cellular
+# (~1428) as the device roams. CSTP-over-TCP is unaffected (TCP segments +
+# MSS-clamps). The kernel tun MTU caps server egress; era-ocserv still advertises
+# the negotiated inner MTU (X-CSTP/X-DTLS-MTU) to the client.
 set -eu
 
 ERA_PORTAL_TOKEN=$(cat /etc/era-ocserv/portal-token)
@@ -28,7 +37,7 @@ exec /usr/local/bin/era-ocserv \
   -tpm-url http://127.0.0.1:9090 \
   -tpm-token "$TPM_TOKEN" \
   -tun-name era-ocserv-tun \
-  -tun-mtu 1500 \
+  -tun-mtu 1300 \
   -tun-queues 0 \
   -tun-ipv6 2001:470:f9d1:9001:ffff::1/128 \
   -server-name eracloud.app \
