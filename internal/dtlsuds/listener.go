@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/zhouchenh/era-ocserv/internal/auth"
 	"github.com/zhouchenh/era-ocserv/internal/iam"
 	"github.com/zhouchenh/era-ocserv/internal/proxyproto"
 	"github.com/zhouchenh/era-ocserv/internal/udshandoff"
@@ -361,19 +362,37 @@ func (l *Listener) handle(ctx context.Context, acc *udshandoff.AcceptedDatagram)
 	if deviceID == "" {
 		return errors.New("dtlsuds: ERA_TLV_DEVICE_ID missing on first datagram")
 	}
+
+	// The DeviceID TLV is diagnostic only: the facade derives a stable UUIDv5
+	// from non-UUID era-portal ids ("dev_<base32>") to satisfy the wire format,
+	// so it is NOT the TPM key. The authoritative device id is the idgen "dev_"
+	// id carried in the MTLS Subject DN CN — exactly the value the CSTP path
+	// resolves with (internal/cstp/connect.go), and what subjectdn.go documents
+	// the UDS path to use. Resolving by the diagnostic UUID fails ("device not
+	// found in TPM").
+	resolveID, err := auth.DeviceIDFromSubjectDN(subjectDN)
+	if err != nil {
+		l.logger.Warn("dtls subject-dn parse failed",
+			slog.String("trace_id", traceID),
+			slog.String("device_id", deviceID),
+			slog.String("err", err.Error()),
+		)
+		return fmt.Errorf("dtlsuds: subject DN device id: %w", err)
+	}
+
 	var psk [32]byte
 	copy(psk[:], pskBytes)
 
 	resolveCtx, cancel := context.WithTimeout(ctx, l.resolveTimeout)
 	defer cancel()
-	ident, err := l.opts.Resolver.Resolve(resolveCtx, deviceID)
+	ident, err := l.opts.Resolver.Resolve(resolveCtx, resolveID)
 	if err != nil {
 		l.logger.Warn("dtls resolve failed",
 			slog.String("trace_id", traceID),
-			slog.String("device_id", deviceID),
+			slog.String("device_id", resolveID),
 			slog.String("err", err.Error()),
 		)
-		return fmt.Errorf("resolve device %s: %w", deviceID, err)
+		return fmt.Errorf("resolve device %s: %w", resolveID, err)
 	}
 	inner := ident.IPv6.Addr()
 	if !inner.IsValid() {

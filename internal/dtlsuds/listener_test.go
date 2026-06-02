@@ -186,7 +186,10 @@ func dtlsTLVs() []proxyproto.TLV {
 		{Type: proxyproto.EraTLVUserID, Value: []byte("user-1")},
 		{Type: proxyproto.EraTLVDTLSPSK, Value: psk},
 		{Type: proxyproto.EraTLVSourceHintV6, Value: sourceV6},
-		{Type: proxyproto.EraTLVMTLSSubjectDN, Value: []byte("CN=device,OU=ERA")},
+		// CN must be a valid idgen "dev_" device id: the listener resolves the
+		// TPM identity from the Subject DN CN (the DeviceID TLV above is the
+		// diagnostic UUID), so a non-idgen CN is rejected before admission.
+		{Type: proxyproto.EraTLVMTLSSubjectDN, Value: []byte("CN=dev_aaaaaaaaaaaaaaaaaaaaaaaaaa,OU=ERA")},
 		{Type: proxyproto.EraTLVTraceID, Value: []byte("01ARZ3NDEKTSV4RRFFQ69G5FAV")},
 		{Type: proxyproto.EraTLVSpecVersion, Value: []byte{proxyproto.SpecVersionStage1}},
 	}
@@ -271,6 +274,53 @@ func defaultResolver() *mockResolver {
 			IPv6:     netip.MustParsePrefix("2001:470:f9d1:9001::abcd/128"),
 			MTU:      1406,
 		},
+	}
+}
+
+// capturingResolver records the device id it was asked to resolve.
+type capturingResolver struct {
+	mu       sync.Mutex
+	gotID    string
+	identity iam.Identity
+}
+
+func (c *capturingResolver) Resolve(_ context.Context, deviceID string) (iam.Identity, error) {
+	c.mu.Lock()
+	c.gotID = deviceID
+	c.mu.Unlock()
+	return c.identity, nil
+}
+
+func (c *capturingResolver) lastID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gotID
+}
+
+// TestListener_ResolvesByCNNotDeviceIDTLV guards the production regression where
+// the DTLS listener resolved the TPM identity from the diagnostic DeviceID TLV
+// (which the facade fills with a derived UUIDv5 for non-UUID era-portal ids)
+// instead of the authoritative idgen "dev_" id in the MTLS Subject DN CN. The
+// wrong key fails ("device not found in TPM") and the DTLS data plane silently
+// dies ~40s in on a real client.
+func TestListener_ResolvesByCNNotDeviceIDTLV(t *testing.T) {
+	sink := newMockSink()
+	lc := &captureLifecycle{}
+	clk := newFakeClock(time.Unix(1_700_000_000, 0))
+	res := &capturingResolver{identity: defaultResolver().identity}
+	_, pc, _ := startListener(t, res, sink, lc, clk)
+
+	frame := buildDgramFrame(t, udshandoff.DirFacadeToBackend, innerUDP6(53000, 443), dtlsTLVs(),
+		append([]byte{pktData}, makeIPv6Ping()...))
+	pc.deliver(frame)
+
+	if err := waitForSink(sink, 1, 2*time.Second); err != nil {
+		t.Fatalf("sink never saw the packet: %v", err)
+	}
+	// dtlsTLVs() sets DeviceID TLV = "abcdef12-..." (UUID) and CN = "dev_aaa…";
+	// resolution MUST use the CN id, never the TLV.
+	if got := res.lastID(); got != "dev_aaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("resolved by %q, want the Subject-DN CN dev_ id (not the DeviceID TLV UUID)", got)
 	}
 }
 
