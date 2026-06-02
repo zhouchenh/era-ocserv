@@ -61,6 +61,15 @@ Pure Go, no CGO. Cross-compile: `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build 
 
 ## Known caveats / follow-ups
 
+- **Per-device DTLS opt-out — era-ocserv side DONE; tpm/era-portal/PWA are follow-ups.** AnyConnect always
+  prefers DTLS when offered, which hurts on UDP-throttled networks. The opt-out CONTRACT is the per-device
+  snapshot field **`ocserv_dtls_disabled`** (bool): the iam resolver decodes it into `Identity.DTLSDisabled`
+  (`internal/iam`), and `handleConnect` suppresses the entire DTLS offer when `id.DTLSDisabled` (or the
+  server-global `Config.DTLSDisabled`) — no `X-DTLS-*` headers, no binding → client uses CSTP/TLS (TCP).
+  Unit-tested both halves (resolver decode + the CONNECT-gate). **NOT end-to-end yet:** tpm does not emit
+  `ocserv_dtls_disabled` (so it defaults false/DTLS-on for everyone); the FOLLOW-UPS are: tpm stores+emits the
+  flag (additive snapshot field, `tpmctl` to set it), era-portal device record + API, and the ERA PWA toggle
+  ("let users opt out DTLS"). All hang off this same field name — keep it stable.
 - **`serverCertSHA1` (`internal/cstp/profile.go`) is a `:443` deploy gate (medium).** The webvpnc
   `sh:` gateway-cert pin (`525FB9...`) is correct on `:1443` (era-ocserv terminates TLS) but is
   the WRONG leaf on the covert `:443` path, where the facade terminates TLS and era-ocserv never

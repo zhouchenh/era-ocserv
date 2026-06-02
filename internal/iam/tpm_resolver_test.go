@@ -36,6 +36,7 @@ type fakeClientConfig struct {
 	SourceIPv6CLAT       string `json:"source_ipv6_clat,omitempty"`
 	SourceIPv6Ocserv     string `json:"source_ipv6_ocserv,omitempty"`
 	SourceIPv6OcservClat string `json:"source_ipv6_ocserv_clat,omitempty"`
+	OcservDTLSDisabled   bool   `json:"ocserv_dtls_disabled,omitempty"`
 	// other fields elided
 }
 
@@ -153,6 +154,40 @@ func TestTPMResolverDecodesOcservCLAT(t *testing.T) {
 	}
 	if want := netip.MustParsePrefix("2001:470:f9d1:9001:c1a7::1/128"); id.IPv6CLAT != want {
 		t.Errorf("IPv6CLAT = %v, want CLAT /128 %v", id.IPv6CLAT, want)
+	}
+}
+
+func TestTPMResolverDecodesOcservDTLSDisabled(t *testing.T) {
+	// Per-device DTLS opt-out CONTRACT: the resolver decodes the snapshot field
+	// "ocserv_dtls_disabled" into Identity.DTLSDisabled (era-ocserv then suppresses
+	// the DTLS offer for this device). Absent ⇒ false ⇒ DTLS offered as usual.
+	for _, tc := range []struct {
+		name string
+		set  bool
+		want bool
+	}{
+		{"opt-out true", true, true},
+		{"absent defaults false", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _ := newTestResolver(t, func(w http.ResponseWriter, req *http.Request) {
+				assertAuth(t, req)
+				writeFakeConfig(t, w, fakeClientConfig{
+					SchemaVersion:      2,
+					DeviceID:           testDeviceID,
+					SourceIPv6Ocserv:   "2001:470:f9d1:9001:0c5e:7777::9/128",
+					OcservDTLSDisabled: tc.set,
+				})
+			}, nil)
+
+			id, err := r.Resolve(context.Background(), testDeviceID)
+			if err != nil {
+				t.Fatalf("Resolve err = %v", err)
+			}
+			if id.DTLSDisabled != tc.want {
+				t.Errorf("DTLSDisabled = %v, want %v", id.DTLSDisabled, tc.want)
+			}
+		})
 	}
 }
 

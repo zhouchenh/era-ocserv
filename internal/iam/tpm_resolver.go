@@ -245,6 +245,11 @@ func (r *TPMResolver) fetch(ctx context.Context, deviceID string) (Identity, err
 		SourceIPv6Native     string `json:"source_ipv6_native"`
 		SourceIPv6Ocserv     string `json:"source_ipv6_ocserv"`
 		SourceIPv6OcservClat string `json:"source_ipv6_ocserv_clat"`
+		// Per-device DTLS opt-out (CONTRACT field). When true, era-ocserv
+		// advertises no DTLS and the client uses CSTP/TLS (TCP) only. Additive +
+		// optional; absent ⇒ false ⇒ DTLS offered as usual. tpm/era-portal/PWA
+		// emit this in a follow-up; era-ocserv reads + enforces it today.
+		OcservDTLSDisabled bool `json:"ocserv_dtls_disabled"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return Identity{}, fmt.Errorf("%w: decode client-config: %v", ErrUpstream, err)
@@ -272,8 +277,9 @@ func (r *TPMResolver) fetch(ctx context.Context, deviceID string) (Identity, err
 	}
 
 	id := Identity{
-		DeviceID: deviceIDOrFallback(raw.DeviceID, deviceID),
-		IPv6:     p,
+		DeviceID:     deviceIDOrFallback(raw.DeviceID, deviceID),
+		IPv6:         p,
+		DTLSDisabled: raw.OcservDTLSDisabled,
 	}
 
 	// Decode the device's CLAT-source /128 (kind ocserv_clat_ipv6),

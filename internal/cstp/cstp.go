@@ -60,6 +60,12 @@ type Identity struct {
 	// MTU is the inner-frame MTU advertised via X-CSTP-MTU. If zero the
 	// server falls back to Config.DefaultMTU.
 	MTU int
+	// DTLSDisabled mirrors iam.Identity.DTLSDisabled: when true the CONNECT
+	// response advertises NO DTLS (no X-DTLS-* headers, no binding) so the
+	// client runs its data plane over CSTP/TLS (TCP) only. This is the
+	// PER-DEVICE opt-out, in addition to the server-global Config.DTLSDisabled;
+	// either being true suppresses the DTLS offer.
+	DTLSDisabled bool
 }
 
 // Config is the construction-time configuration for a CSTP Server. All

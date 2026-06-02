@@ -88,11 +88,13 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// all (its `route` directives are commented out). So v4 stays plain 0.0.0.0/0
 	// tunnel-all; iOS keeps loopback/link-local/multicast on the local link by
 	// itself. See iosV4SplitExclude for the set to use on a /24-lease/non-iOS path.
-	// DTLS advertisement. Suppressed entirely when DTLSDisabled so the client
-	// runs its data plane over CSTP/TLS (TCP) only — the diagnostic/fallback
-	// path for edges where the DTLS-over-UDP leg cannot round-trip.
+	// DTLS advertisement. Suppressed entirely when DTLS is disabled — either
+	// server-globally (Config.DTLSDisabled) or PER-DEVICE (id.DTLSDisabled, the
+	// tpm "ocserv_dtls_disabled" opt-out) — so the client runs its data plane
+	// over CSTP/TLS (TCP) only. AnyConnect always prefers DTLS when offered, so
+	// the per-device opt-out is the escape hatch for networks that throttle UDP.
 	var tunnelDTLS *dtlsBindingState
-	if !s.cfg.DTLSDisabled {
+	if !s.cfg.DTLSDisabled && !id.DTLSDisabled {
 		if s.cfg.DTLSBindingInstaller != nil && s.cfg.DTLSBindingSource != nil {
 			if binding, ok := s.cfg.DTLSBindingSource(r, id); ok {
 				// The facade routes the absolute AnyConnect CONNECT via its control

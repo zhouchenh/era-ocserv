@@ -34,6 +34,14 @@ type Identity struct {
 	// DefaultDomain is an optional X-CSTP-Default-Domain override.
 	// Empty means do not emit the header.
 	DefaultDomain string
+	// DTLSDisabled, when true, opts THIS device out of the DTLS (UDP) data
+	// channel: era-ocserv advertises no X-DTLS-* headers, so the AnyConnect
+	// client runs its data plane over CSTP/TLS (TCP) only. AnyConnect always
+	// prefers DTLS when offered, so this is the per-device escape hatch for
+	// networks where UDP is throttled/deprioritized. Sourced from the tpm
+	// snapshot field "ocserv_dtls_disabled"; absent/false ⇒ DTLS offered as
+	// usual. Intended future control surface: a user toggle in the ERA PWA.
+	DTLSDisabled bool
 }
 
 // Resolver looks up an Identity for a device UUID. Implementations are
