@@ -214,6 +214,20 @@ func (b *bridge) pumpTunQueue(ctx context.Context, q *tun.Queue) {
 		isCLAT := ac.clatV6.IsValid() && dst == ac.clatV6
 		xlat := ac.xlat
 		ac.mu.Unlock()
+		// Server-side ICMPv6 PTB origination (DEC-l3-mtu-model): the inner link
+		// MTU is 1400 (native /128) or 1420 (CLAT /128, pre-SIIT64; the −20 on
+		// v6->v4 translation yields the 1400 inner v4). An oversize packet is
+		// DROPPED and a PTB is sent to its v6 source so PMTUD shrinks the sender —
+		// never a silent drop, and we never shrink the static 1400/1420.
+		if isCLAT {
+			if n > ptbCapCLAT {
+				b.originatePTB(q, dst, ptbCapCLAT, buf[:n])
+				continue
+			}
+		} else if n > ptbCapNative {
+			b.originatePTB(q, dst, ptbCapNative, buf[:n])
+			continue
+		}
 		if isCLAT {
 			if xlat == nil {
 				continue

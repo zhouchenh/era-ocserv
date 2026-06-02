@@ -11,21 +11,19 @@
 # arrives per-session from the tpm client-config (source_ipv6_ocserv_clat) via
 # the iam resolver.
 #
-# -tun-mtu 1400: LOCKED L3 MTU model per PM directive DEC-l3-mtu-model
-# (_program/DECISION_LOG.md). era-ocserv advertises X-CSTP-MTU = X-DTLS-MTU = 1400
-# (EQUAL) to every client; the tun carries full 1400-B inner packets and the
-# server owns the +20-B v4->v6 SIIT growth (1400 inner -> 1420 v6 == the
-# IPv6OutboundMTU, fits the 464PLAT egress without fragmentation). We do NOT
-# pre-shrink for CLAT. Equal MTUs keep the client's single utun safe across
-# DTLS<->CSTP failover. CSTP rides TCP so never needs less (segments + the
-# era-ocserv-tun MSS clamp: v6 1340 / v4 1360 = 1400 - IP - TCP).
-# CAVEAT: a full-MSS DTLS-over-UDP return datagram is ~1486 B on the wire (1400
-# inner + ~86 B SIIT/DTLS/UDP/IPv4-outer); it clears broadband (1500) but may
-# exceed a sub-1486 cellular last-mile. That is DTLS-PMTUD's job, not a reason to
-# pin the MTU low for everyone (the earlier 1300 was set while DTLS was broken).
-# NOTE: era-ocserv does NOT yet originate ICMPv6-PTB for oversize data (it only
-# translates transiting ICMP errors), so cellular oversize relies on the DTLS
-# layer's own PMTUD — validate a real-iPhone CELLULAR large transfer.
+# -tun-mtu 1420: LOCKED L3 MTU model per DEC-l3-mtu-model (_program/DECISION_LOG.md).
+# This is the SERVER-SIDE tun MTU only. The WIRE advertised to the client is ALWAYS
+# 1400 (X-CSTP-MTU = X-DTLS-MTU = 1400, set in code: negotiateInnerMTU returns the
+# locked const, INDEPENDENT of this flag). The tun is 1420 because a CLAT v4 packet,
+# after the on-server v4->v6 SIIT (+20), becomes a 1420-B IPv6 packet that must
+# transit this tun toward the Internet (1400 inner v4 -> 1420 v6 == IPv6OutboundMTU,
+# fits the clean 1500 datacenter egress). Native IPv6 has ZERO translation and is
+# 1400 everywhere. The ±20 is ENTIRELY server-side and never touches the client
+# wire; no DTLS/CSTP datagram is sized with the +20.
+# MSS clamp off the 1400 wire: v6 1340 (1400-60), v4 1360 (1400-40) — nft on
+# era-ocserv-tun. Dynamic PMTUD for constrained tails (cellular, v6-outer) is
+# driven by server-side ICMPv6-PTB origination (DEC-l3-mtu-model); do NOT shrink
+# the static 1400/1420 to compensate.
 set -eu
 
 ERA_PORTAL_TOKEN=$(cat /etc/era-ocserv/portal-token)
@@ -43,7 +41,7 @@ exec /usr/local/bin/era-ocserv \
   -tpm-url http://127.0.0.1:9090 \
   -tpm-token "$TPM_TOKEN" \
   -tun-name era-ocserv-tun \
-  -tun-mtu 1400 \
+  -tun-mtu 1420 \
   -tun-queues 0 \
   -tun-ipv6 2001:470:f9d1:9001:ffff::1/128 \
   -server-name eracloud.app \
