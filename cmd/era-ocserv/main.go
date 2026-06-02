@@ -497,11 +497,22 @@ func sharedEdgeDTLSBindingSource(r *http.Request, id cstp.Identity) (cstp.DTLSBi
 	}
 	var token [12]byte
 	copy(token[:], info.Token)
+	// The DTLS data path (internal/dtlsuds) re-resolves the device from the
+	// binding's Subject DN CN. On the AnyConnect password path the facade holds
+	// no client cert and forwards a PLACEHOLDER Subject DN (e.g.
+	// CN=dev_aaaa...26), which is not a real device — resolving it fails with
+	// "device not found in TPM". Carry the REAL resolved device id here instead:
+	// it is the exact value the TPM resolver and the CSTP path (connect.go) key
+	// on. Fall back to the forwarded DN only if the resolved id is unset.
+	subjectDN := info.SubjectDN
+	if id.DeviceID != "" {
+		subjectDN = "CN=" + id.DeviceID
+	}
 	return cstp.DTLSBinding{
 		SourceIP:      info.ClientSrc.Addr().Unmap(),
 		DeviceID:      id.DeviceID,
 		UserID:        info.UserID,
-		MTLSSubjectDN: info.SubjectDN,
+		MTLSSubjectDN: subjectDN,
 		SourceV6:      info.SourceHintV6,
 		Token:         token,
 	}, true
