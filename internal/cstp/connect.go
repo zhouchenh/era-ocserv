@@ -219,39 +219,23 @@ func extractWebVPNCookie(r *http.Request) string {
 // X-CSTP-Base-MTU stays 1500.
 const clatInnerMTUCap = 1400
 
-// negotiateInnerMTU computes the inner-frame MTU from the client's
-// declared base + preferred MTUs per spec §1.7, capped at the per-
-// device configured MTU and at clatInnerMTUCap (so neither the v4 CLAT nor
-// the native v6 inner path fragments post-translation). Missing headers fall
-// back to defaults.
-func negotiateInnerMTU(r *http.Request, deviceMTU int) int {
-	baseMTU := atoiDefault(r.Header.Get("X-CSTP-Base-MTU"), 1500)
-	want := atoiDefault(r.Header.Get("X-CSTP-MTU"), deviceMTU)
-	// inner = base - ~80 (TLS record + CSTP header + AEAD overhead +
-	// safety pad). We use the spec's documented approximation.
-	innerFromBase := baseMTU - 80
-	if innerFromBase < 576 {
-		innerFromBase = 576
-	}
-	// pick the smallest of (client's preferred, base-derived,
-	// device-configured), bounded below by 576 (the RFC 791 minimum
-	// reassembly buffer that any IPv4 host accepts).
-	result := innerFromBase
-	if want > 0 && want < result {
-		result = want
-	}
-	if deviceMTU > 0 && deviceMTU < result {
-		result = deviceMTU
-	}
-	// Cap at the SIIT-safe ceiling so a full-MTU inner v4 packet still fits
-	// the v6 egress after the 20-byte header growth.
-	if result > clatInnerMTUCap {
-		result = clatInnerMTUCap
-	}
-	if result < 576 {
-		result = 576
-	}
-	return result
+// negotiateInnerMTU returns the inner-frame MTU advertised to the client.
+//
+// LOCKED at exactly clatInnerMTUCap (1400) per PM directive DEC-l3-mtu-model:
+// every client is told 1400 regardless of its X-CSTP-Base-MTU (no base-80
+// reduction), its requested X-CSTP-MTU, or any per-device MTU. A cellular client
+// (X-CSTP-Base-MTU ~1428) would otherwise be advertised base-80 ≈ 1348 and
+// shrink its single utun; holding a fixed 1400 keeps DTLS↔CSTP failover from
+// ever reconfiguring the tun (X-CSTP-MTU and X-DTLS-MTU both derive from this one
+// value, so they stay EQUAL by construction). The server owns the +20 B v4→v6
+// SIIT growth: 1400 inner → 1420 v6 == IPv6OutboundMTU, fits the 464PLAT egress
+// without fragmentation; we do NOT pre-shrink for CLAT. 1400 fits every common
+// path; CSTP rides TCP (segments + MSS-clamp) so it never needs less, and any
+// sub-1486-B cellular last-mile on the DTLS leg is DTLS-PMTUD's job, not a
+// reason to under-advertise everyone. The r/deviceMTU params are retained for
+// the signature but intentionally unused.
+func negotiateInnerMTU(_ *http.Request, _ int) int {
+	return clatInnerMTUCap
 }
 
 func atoiDefault(s string, fallback int) int {

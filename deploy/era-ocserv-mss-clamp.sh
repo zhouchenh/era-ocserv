@@ -13,10 +13,11 @@
 # its traffic routes via era-clat (a 1280-MTU iface). era-ocserv instead SIITs the
 # inner packet and routes it out eth0 (MTU 1500), so `rt mtu` would resolve to
 # 1500 and miss the real bottleneck: the AnyConnect client is reached over
-# DTLS-in-UDP-in-IPv6 (the covert :443 path), whose encapsulation (~98 B) plus the
-# SIIT +20 must fit the ~1500 outer MTU. MSS 1280 -> max ~1300 B inner v4 ->
-# ~1398 B outer: safe headroom on any path >= the IPv6 minimum. Without this, the
-# TCP handshake completes but the first full-size data segment blackholes.
+# DTLS-in-UDP (the covert :443 path) plus the SIIT +20 must fit the path MTU.
+# Per DEC-l3-mtu-model the inner MTU is LOCKED at 1400, so the inner TCP MSS is the
+# plain MTU-derived value per family: v6 1340 (1400-40-20), v4 1360 (1400-20-20) —
+# see the per-family vars below. Without this, the TCP handshake completes but the
+# first full-size data segment blackholes.
 set -eu
 
 # --- Outer AnyConnect MSS clamp (covert :443 path) ---------------------------
@@ -47,7 +48,12 @@ echo "era-ocserv-mss-clamp: outer :443 MSS clamp ensured ($OUTER_MSS)"
 TABLE="inet era_nat64"
 CHAIN="forward"
 TAG="era-ocserv-clat"
-MSS="1280"
+# LOCKED L3 MTU model (DEC-l3-mtu-model): inner MTU 1400, so MSS = MTU - IP - TCP,
+# per family. NO CLAT pre-shrink (we do NOT subtract the SIIT +20 here) — the
+# server owns the v4->v6 growth on egress; this clamp only sizes inner TCP to the
+# 1400 tunnel MTU. Replaces the old over-conservative 1280 (set while DTLS broke).
+MSS6="1340"   # 1400 - 40 (IPv6 hdr) - 20 (TCP hdr)
+MSS4="1360"   # 1400 - 20 (IPv4 hdr) - 20 (TCP hdr)
 
 if ! nft list table $TABLE >/dev/null 2>&1; then
   echo "era-ocserv-mss-clamp: table '$TABLE' absent (WG/CLAT deploy owns it); skipping" >&2
@@ -60,6 +66,8 @@ nft -a list chain $TABLE $CHAIN 2>/dev/null \
   | grep -oE 'handle [0-9]+' | awk '{print $2}' \
   | while read -r h; do nft delete rule $TABLE $CHAIN handle "$h"; done
 
-nft add rule $TABLE $CHAIN iifname "era-ocserv-tun" tcp flags syn tcp option maxseg size set $MSS comment "$TAG"
-nft add rule $TABLE $CHAIN oifname "era-ocserv-tun" tcp flags syn tcp option maxseg size set $MSS comment "$TAG"
-echo "era-ocserv-mss-clamp: era-ocserv-tun MSS clamp ensured"
+nft add rule $TABLE $CHAIN iifname "era-ocserv-tun" meta nfproto ipv6 tcp flags syn tcp option maxseg size set $MSS6 comment "$TAG"
+nft add rule $TABLE $CHAIN oifname "era-ocserv-tun" meta nfproto ipv6 tcp flags syn tcp option maxseg size set $MSS6 comment "$TAG"
+nft add rule $TABLE $CHAIN iifname "era-ocserv-tun" meta nfproto ipv4 tcp flags syn tcp option maxseg size set $MSS4 comment "$TAG"
+nft add rule $TABLE $CHAIN oifname "era-ocserv-tun" meta nfproto ipv4 tcp flags syn tcp option maxseg size set $MSS4 comment "$TAG"
+echo "era-ocserv-mss-clamp: era-ocserv-tun MSS clamp ensured (v6 $MSS6 / v4 $MSS4)"

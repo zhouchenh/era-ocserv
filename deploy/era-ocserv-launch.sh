@@ -11,15 +11,21 @@
 # arrives per-session from the tpm client-config (source_ipv6_ocserv_clat) via
 # the iam resolver.
 #
-# -tun-mtu 1300 (NOT 1500): the DTLS data plane sends each inner packet as ONE
-# DTLS-over-UDP datagram (no segmentation, unlike CSTP-over-TCP). At a 1500 tun
-# the encrypted datagram (~+66 B: IP+UDP+DTLS record+GCM tag) overran the ~1500
-# path MTU and AnyConnect dropped every large server->client frame (verified on a
-# real iPhone: data frames received ~0, control frames fine — a stuck tunnel).
-# 1300 keeps the wire datagram ~1366 B — safe on Wi-Fi (1500) AND cellular
-# (~1428) as the device roams. CSTP-over-TCP is unaffected (TCP segments +
-# MSS-clamps). The kernel tun MTU caps server egress; era-ocserv still advertises
-# the negotiated inner MTU (X-CSTP/X-DTLS-MTU) to the client.
+# -tun-mtu 1400: LOCKED L3 MTU model per PM directive DEC-l3-mtu-model
+# (_program/DECISION_LOG.md). era-ocserv advertises X-CSTP-MTU = X-DTLS-MTU = 1400
+# (EQUAL) to every client; the tun carries full 1400-B inner packets and the
+# server owns the +20-B v4->v6 SIIT growth (1400 inner -> 1420 v6 == the
+# IPv6OutboundMTU, fits the 464PLAT egress without fragmentation). We do NOT
+# pre-shrink for CLAT. Equal MTUs keep the client's single utun safe across
+# DTLS<->CSTP failover. CSTP rides TCP so never needs less (segments + the
+# era-ocserv-tun MSS clamp: v6 1340 / v4 1360 = 1400 - IP - TCP).
+# CAVEAT: a full-MSS DTLS-over-UDP return datagram is ~1486 B on the wire (1400
+# inner + ~86 B SIIT/DTLS/UDP/IPv4-outer); it clears broadband (1500) but may
+# exceed a sub-1486 cellular last-mile. That is DTLS-PMTUD's job, not a reason to
+# pin the MTU low for everyone (the earlier 1300 was set while DTLS was broken).
+# NOTE: era-ocserv does NOT yet originate ICMPv6-PTB for oversize data (it only
+# translates transiting ICMP errors), so cellular oversize relies on the DTLS
+# layer's own PMTUD — validate a real-iPhone CELLULAR large transfer.
 set -eu
 
 ERA_PORTAL_TOKEN=$(cat /etc/era-ocserv/portal-token)
@@ -37,7 +43,7 @@ exec /usr/local/bin/era-ocserv \
   -tpm-url http://127.0.0.1:9090 \
   -tpm-token "$TPM_TOKEN" \
   -tun-name era-ocserv-tun \
-  -tun-mtu 1300 \
+  -tun-mtu 1400 \
   -tun-queues 0 \
   -tun-ipv6 2001:470:f9d1:9001:ffff::1/128 \
   -server-name eracloud.app \
