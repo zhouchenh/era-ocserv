@@ -18,7 +18,8 @@ type Identity struct {
 	// address is always inside the configured pool.
 	IPv6 netip.Prefix
 	// IPv6CLAT is the device's SECOND /128 (kind ocserv_clat_ipv6),
-	// advertised by TPM as source_ipv6_ocserv_clat. It is the source
+	// advertised by current TPM as source_ipv6_clat, with legacy fallback for
+	// source_ipv6_ocserv_clat during rollout. It is the source
 	// address era-ocserv's stateless SIIT engine uses for the client's
 	// inner-IPv4 (CLAT) traffic: the placeholder 192.0.0.1 is translated to
 	// 64:ff9b::<v4dst> sourced from this /128. An invalid (zero) value means

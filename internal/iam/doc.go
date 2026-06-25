@@ -26,6 +26,10 @@
 //     the result as a netip.Prefix. Per DEC-anyconnect-own-128 an AnyConnect
 //     device gets its own /128 and may coexist with a WireGuard binding; this
 //     package only READS the binding.
+//   - A CLAT-enabled AnyConnect device also advertises source_ipv6_clat
+//     (preferred, current TPM main) or source_ipv6_ocserv_clat (legacy
+//     deployed TPM branch). The resolver accepts both and prefers the shared
+//     source_ipv6_clat field.
 //
 // Subject to revision: the endpoint path or response shape may evolve when
 // the era-ocserv tpmctl subcommands land (a separate agent's work). If a

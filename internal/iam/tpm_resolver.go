@@ -243,6 +243,7 @@ func (r *TPMResolver) fetch(ctx context.Context, deviceID string) (Identity, err
 	var raw struct {
 		DeviceID             string `json:"device_id"`
 		SourceIPv6Native     string `json:"source_ipv6_native"`
+		SourceIPv6CLAT       string `json:"source_ipv6_clat"`
 		SourceIPv6Ocserv     string `json:"source_ipv6_ocserv"`
 		SourceIPv6OcservClat string `json:"source_ipv6_ocserv_clat"`
 		// Per-device DTLS opt-out (CONTRACT field). When true, era-ocserv
@@ -282,15 +283,21 @@ func (r *TPMResolver) fetch(ctx context.Context, deviceID string) (Identity, err
 		DTLSDisabled: raw.OcservDTLSDisabled,
 	}
 
-	// Decode the device's CLAT-source /128 (kind ocserv_clat_ipv6),
-	// advertised as source_ipv6_ocserv_clat. It is validated with the SAME
-	// /128 + IPv6 + in-pool rules as the native /128. An empty value means
-	// CLAT is disabled for this device (the session runs v6-only); only a
-	// PRESENT-but-malformed value is an error, so an additive TPM that does
-	// not yet emit the field, or a device without a second /128, both fall
-	// through cleanly.
-	if clatPrefix := strings.TrimSpace(raw.SourceIPv6OcservClat); clatPrefix != "" {
-		clatP, clatErr := r.validatePoolHost128("source_ipv6_ocserv_clat", clatPrefix)
+	// Decode the device's CLAT-source /128 (kind ocserv_clat_ipv6).
+	// Current TPM emits the shared CLAT-source field source_ipv6_clat; the
+	// older live branch emitted the method-specific source_ipv6_ocserv_clat.
+	// Prefer the shared field so this resolver matches current TPM main, but
+	// keep the legacy fallback to avoid breaking a staggered rollout.
+	clatPrefix := strings.TrimSpace(raw.SourceIPv6CLAT)
+	clatField := "source_ipv6_clat"
+	if clatPrefix == "" {
+		clatPrefix = strings.TrimSpace(raw.SourceIPv6OcservClat)
+		clatField = "source_ipv6_ocserv_clat"
+	}
+	// An empty value means CLAT is disabled for this device (the session runs
+	// v6-only); only a present-but-malformed value is an error.
+	if clatPrefix != "" {
+		clatP, clatErr := r.validatePoolHost128(clatField, clatPrefix)
 		if clatErr != nil {
 			return Identity{}, clatErr
 		}

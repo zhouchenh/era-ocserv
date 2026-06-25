@@ -133,15 +133,15 @@ func TestTPMResolverPrefersOcservAddress(t *testing.T) {
 
 func TestTPMResolverDecodesOcservCLAT(t *testing.T) {
 	// A CLAT-enabled AnyConnect device carries a SECOND ocserv /128
-	// (source_ipv6_ocserv_clat). The resolver decodes it into IPv6CLAT while
-	// the native ocserv /128 stays in IPv6.
+	// (source_ipv6_clat). The resolver decodes it into IPv6CLAT while the
+	// native ocserv /128 stays in IPv6.
 	r, _ := newTestResolver(t, func(w http.ResponseWriter, req *http.Request) {
 		assertAuth(t, req)
 		writeFakeConfig(t, w, fakeClientConfig{
-			SchemaVersion:        2,
-			DeviceID:             testDeviceID,
-			SourceIPv6Ocserv:     "2001:470:f9d1:9001:0c5e:7777::9/128",
-			SourceIPv6OcservClat: "2001:470:f9d1:9001:c1a7::1/128",
+			SchemaVersion:    3,
+			DeviceID:         testDeviceID,
+			SourceIPv6Ocserv: "2001:470:f9d1:9001:0c5e:7777::9/128",
+			SourceIPv6CLAT:   "2001:470:f9d1:9001:c1a7::1/128",
 		})
 	}, nil)
 
@@ -154,6 +154,49 @@ func TestTPMResolverDecodesOcservCLAT(t *testing.T) {
 	}
 	if want := netip.MustParsePrefix("2001:470:f9d1:9001:c1a7::1/128"); id.IPv6CLAT != want {
 		t.Errorf("IPv6CLAT = %v, want CLAT /128 %v", id.IPv6CLAT, want)
+	}
+}
+
+func TestTPMResolverDecodesLegacyOcservCLAT(t *testing.T) {
+	// The deployed TPM branch used source_ipv6_ocserv_clat. Keep decoding it
+	// so an ocserv-first rollout does not disable CLAT before TPM is swapped.
+	r, _ := newTestResolver(t, func(w http.ResponseWriter, req *http.Request) {
+		assertAuth(t, req)
+		writeFakeConfig(t, w, fakeClientConfig{
+			SchemaVersion:        2,
+			DeviceID:             testDeviceID,
+			SourceIPv6Ocserv:     "2001:470:f9d1:9001:0c5e:7777::9/128",
+			SourceIPv6OcservClat: "2001:470:f9d1:9001:c1a7::2/128",
+		})
+	}, nil)
+
+	id, err := r.Resolve(context.Background(), testDeviceID)
+	if err != nil {
+		t.Fatalf("Resolve err = %v", err)
+	}
+	if want := netip.MustParsePrefix("2001:470:f9d1:9001:c1a7::2/128"); id.IPv6CLAT != want {
+		t.Errorf("IPv6CLAT = %v, want legacy CLAT /128 %v", id.IPv6CLAT, want)
+	}
+}
+
+func TestTPMResolverPrefersSharedCLATOverLegacyCLAT(t *testing.T) {
+	r, _ := newTestResolver(t, func(w http.ResponseWriter, req *http.Request) {
+		assertAuth(t, req)
+		writeFakeConfig(t, w, fakeClientConfig{
+			SchemaVersion:        3,
+			DeviceID:             testDeviceID,
+			SourceIPv6Ocserv:     "2001:470:f9d1:9001:0c5e:7777::9/128",
+			SourceIPv6CLAT:       "2001:470:f9d1:9001:c1a7::3/128",
+			SourceIPv6OcservClat: "2001:470:f9d1:9001:c1a7::4/128",
+		})
+	}, nil)
+
+	id, err := r.Resolve(context.Background(), testDeviceID)
+	if err != nil {
+		t.Fatalf("Resolve err = %v", err)
+	}
+	if want := netip.MustParsePrefix("2001:470:f9d1:9001:c1a7::3/128"); id.IPv6CLAT != want {
+		t.Errorf("IPv6CLAT = %v, want shared CLAT /128 %v", id.IPv6CLAT, want)
 	}
 }
 
