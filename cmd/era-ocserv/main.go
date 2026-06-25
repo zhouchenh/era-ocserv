@@ -1,11 +1,520 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"flag"
 	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/zhouchenh/era-ocserv/internal/auth"
+	"github.com/zhouchenh/era-ocserv/internal/cstp"
+	"github.com/zhouchenh/era-ocserv/internal/dtlsuds"
+	"github.com/zhouchenh/era-ocserv/internal/iam"
+	"github.com/zhouchenh/era-ocserv/internal/tun"
+	"github.com/zhouchenh/era-ocserv/internal/udshandoff"
+	"github.com/zhouchenh/era-ocserv/internal/udsserve"
 )
 
+type config struct {
+	mode             string
+	udsSocketPath    string
+	listenAddr       string
+	tlsCertPath      string
+	tlsKeyPath       string
+	clientCAPath     string
+	portalURL        string
+	portalToken      string
+	tpmURL           string
+	tpmToken         string
+	tunName          string
+	tunMTU           int
+	tunQueues        int
+	tunIPv6          string
+	serverName       string
+	serverCertSHA1   string
+	dnsServers       string
+	defaultDomain    string
+	logLevel         string
+	facadeAdminURL   string
+	facadeAdminToken string
+	// dtlsUDSSocket, when non-empty, enables the ADR-F7 Wave IV (stream O-S)
+	// AnyConnect-DTLS UDS DGRAM consumer alongside whichever CSTP listener
+	// the resolved -mode picks. era-facade decrypts DTLS upstream and hands
+	// the plaintext L3 packets over this socket; era-ocserv plumbs them
+	// into the same tun device the CSTP path uses. Pass 'default' to take
+	// dtlsuds.DefaultSocketPath. Empty disables (default).
+	dtlsUDSSocket string
+	// disableDTLS suppresses ALL DTLS advertisement in the CSTP CONNECT
+	// response so clients carry their data plane over CSTP/TLS (TCP) only.
+	// Diagnostic/fallback for edges where the DTLS-over-UDP leg cannot
+	// round-trip.
+	disableDTLS bool
+}
+
+func parseFlags() config {
+	var c config
+	flag.StringVar(&c.mode, "mode", "auto",
+		"listener mode: auto|uds|legacy. auto = UDS if -uds-socket parent dir exists, else legacy. "+
+			"UDS mode consumes facade plaintext handoffs per ADR-F7 Stage 2; legacy = own TLS at -listen (pre-cutover compat).")
+	flag.StringVar(&c.udsSocketPath, "uds-socket", udsserve.DefaultSocketPath,
+		"UDS socket path the facade connects to. Used by -mode=uds and by -mode=auto when the parent dir exists.")
+	flag.StringVar(&c.listenAddr, "listen", "127.0.0.1:8444", "(legacy mode) loopback TCP listen address for CSTP")
+	flag.StringVar(&c.tlsCertPath, "tls-cert", "", "(legacy mode) path to TLS cert PEM")
+	flag.StringVar(&c.tlsKeyPath, "tls-key", "", "(legacy mode) path to TLS key PEM")
+	flag.StringVar(&c.clientCAPath, "client-ca", "", "(legacy mode) path to ERA PKI client CA PEM for mTLS")
+	flag.StringVar(&c.portalURL, "era-portal-url", "", "era-portal base URL for password verification (required)")
+	flag.StringVar(&c.portalToken, "era-portal-token", "", "era-portal service token (required)")
+	flag.StringVar(&c.tpmURL, "tpm-url", "", "TPM provisioning base URL (required)")
+	flag.StringVar(&c.tpmToken, "tpm-token", "", "TPM service token (required)")
+	flag.StringVar(&c.tunName, "tun-name", "era-ocserv-tun", "tun interface name")
+	flag.IntVar(&c.tunMTU, "tun-mtu", 1500, "tun MTU")
+	flag.IntVar(&c.tunQueues, "tun-queues", 0, "tun queue count (0 = default min(NumCPU, 4))")
+	flag.StringVar(&c.tunIPv6, "tun-ipv6", "", "tun's own /128 IPv6 (e.g. 2001:470:f9d1:9001:ffff::1/128); empty leaves unset")
+	flag.StringVar(&c.serverName, "server-name", "eracloud.app", "server name advertised in CSTP")
+	flag.StringVar(&c.serverCertSHA1, "server-cert-sha1", "", "(covert :443) uppercase-hex SHA-1 of the facade's public TLS leaf for the webvpnc sh: pin; empty uses the built-in eracloud.app constant")
+	flag.StringVar(&c.dnsServers, "dns", "2606:4700:4700::1111,2606:4700:4700::1001", "comma-separated DNS servers pushed via X-CSTP-DNS")
+	flag.StringVar(&c.defaultDomain, "default-domain", "", "DNS default domain pushed via X-CSTP-Default-Domain")
+	flag.StringVar(&c.logLevel, "log-level", "info", "log level: debug|info|warn|error")
+	flag.StringVar(&c.facadeAdminURL, "facade-admin-url", "", "era-facade admin base URL for shared-edge DTLS bindings (e.g. http://127.0.0.1:8780)")
+	flag.StringVar(&c.facadeAdminToken, "facade-admin-token", "", "era-facade admin service token used to publish shared-edge DTLS bindings")
+	flag.BoolVar(&c.disableDTLS, "disable-dtls", false,
+		"suppress all DTLS advertisement so clients use CSTP/TLS (TCP) for data (diagnostic/fallback)")
+	flag.StringVar(&c.dtlsUDSSocket, "dtls-uds-socket", "",
+		"DTLS UDS DGRAM socket path (Wave IV O-S). Empty disables. "+
+			"Pass 'default' to use the canonical "+dtlsuds.DefaultSocketPath+".")
+	flag.Parse()
+	if c.dtlsUDSSocket == "default" {
+		c.dtlsUDSSocket = dtlsuds.DefaultSocketPath
+	}
+	return c
+}
+
 func main() {
-	fmt.Fprintln(os.Stderr, "era-ocserv: stage 1 scaffold; see README.md")
-	os.Exit(0)
+	if err := run(); err != nil {
+		slog.Error("era-ocserv exited", "err", err)
+		os.Exit(1)
+	}
+}
+
+// listenerMode is the resolved-after-auto choice between UDS plaintext
+// (ADR-F7 Stage 2) and legacy loopback TCP+TLS (pre-cutover compat).
+type listenerMode int
+
+const (
+	modeLegacy listenerMode = iota
+	modeUDS
+)
+
+func (m listenerMode) String() string {
+	switch m {
+	case modeUDS:
+		return "uds"
+	case modeLegacy:
+		return "legacy"
+	default:
+		return "unknown"
+	}
+}
+
+func resolveMode(cfg config) (listenerMode, error) {
+	switch strings.ToLower(strings.TrimSpace(cfg.mode)) {
+	case "uds":
+		return modeUDS, nil
+	case "legacy":
+		return modeLegacy, nil
+	case "", "auto":
+		// Auto-detect: UDS if the socket parent directory exists,
+		// legacy otherwise. The facade's systemd unit creates the
+		// directory at boot; on hosts where the facade is not deployed
+		// the dir is absent and we fall back to legacy. This is the
+		// graceful-cutover knob the Wave II spec asks for.
+		dir := filepath.Dir(cfg.udsSocketPath)
+		if st, err := os.Stat(dir); err == nil && st.IsDir() {
+			return modeUDS, nil
+		}
+		return modeLegacy, nil
+	default:
+		return modeLegacy, fmt.Errorf("unknown -mode %q (want auto|uds|legacy)", cfg.mode)
+	}
+}
+
+func run() error {
+	cfg := parseFlags()
+	if err := setupLogger(cfg.logLevel); err != nil {
+		return err
+	}
+	mode, err := resolveMode(cfg)
+	if err != nil {
+		return err
+	}
+	if err := requireFlags(cfg, mode); err != nil {
+		return err
+	}
+
+	var (
+		tlsCfg *tls.Config
+	)
+	if mode == modeLegacy {
+		tlsCfg, err = loadTLS(cfg)
+		if err != nil {
+			return fmt.Errorf("load TLS: %w", err)
+		}
+	}
+
+	dev, err := openTun(cfg)
+	if err != nil {
+		return fmt.Errorf("open tun: %w", err)
+	}
+	defer dev.Close()
+	slog.Info("tun opened", "name", dev.Name(), "queues", len(dev.Queues()), "mtu", cfg.tunMTU)
+
+	portalBase, err := url.Parse(cfg.portalURL)
+	if err != nil {
+		return fmt.Errorf("parse era-portal-url: %w", err)
+	}
+	hv := auth.NewHTTPVerifier(auth.HTTPVerifierConfig{
+		BaseURL:      portalBase,
+		ServiceToken: cfg.portalToken,
+	})
+
+	tpmBase, err := url.Parse(cfg.tpmURL)
+	if err != nil {
+		return fmt.Errorf("parse tpm-url: %w", err)
+	}
+	tpmResolver := iam.NewTPMResolver(iam.TPMResolverConfig{
+		BaseURL:      tpmBase,
+		ServiceToken: cfg.tpmToken,
+	})
+
+	dns, err := parseDNS(cfg.dnsServers)
+	if err != nil {
+		return fmt.Errorf("parse dns: %w", err)
+	}
+
+	var dtlsBindings cstp.DTLSBindingInstaller
+	if strings.TrimSpace(cfg.facadeAdminURL) != "" || strings.TrimSpace(cfg.facadeAdminToken) != "" {
+		if strings.TrimSpace(cfg.facadeAdminURL) == "" || strings.TrimSpace(cfg.facadeAdminToken) == "" {
+			return fmt.Errorf("facade dtls binding config requires both -facade-admin-url and -facade-admin-token")
+		}
+		facadeBase, err := url.Parse(cfg.facadeAdminURL)
+		if err != nil {
+			return fmt.Errorf("parse facade-admin-url: %w", err)
+		}
+		dtlsBindings, err = cstp.NewHTTPDTLSBindingInstaller(cstp.HTTPDTLSBindingInstallerConfig{
+			BaseURL:      facadeBase,
+			ServiceToken: cfg.facadeAdminToken,
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	srv := cstp.NewServer(cstp.Config{
+		Verifier:             hv,
+		Resolver:             resolverAdapter{inner: tpmResolver},
+		ServerName:           cfg.serverName,
+		ServerCertSHA1:       cfg.serverCertSHA1,
+		DNS:                  dns,
+		DefaultDomain:        cfg.defaultDomain,
+		DefaultMTU:           cfg.tunMTU,
+		DPDInterval:          30,
+		KeepaliveInterval:    20,
+		IdleTimeout:          1800,
+		SessionTimeout:       24 * time.Hour,
+		DTLSBindingInstaller: dtlsBindings,
+		DTLSBindingSource:    sharedEdgeDTLSBindingSource,
+		DTLSDisabled:         cfg.disableDTLS,
+	})
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	br := newBridge(dev, srv)
+	go br.run(ctx)
+
+	dtlsListener, err := startDTLSListener(ctx, cfg, br, tpmResolver, dev)
+	if err != nil {
+		return fmt.Errorf("start dtls listener: %w", err)
+	}
+	defer func() {
+		if dtlsListener != nil {
+			if err := dtlsListener.Close(); err != nil {
+				slog.Warn("dtls listener close", "err", err)
+			}
+		}
+	}()
+
+	switch mode {
+	case modeUDS:
+		return runUDS(ctx, cfg, srv)
+	case modeLegacy:
+		return runLegacy(ctx, cfg, tlsCfg, srv)
+	default:
+		return fmt.Errorf("unreachable: mode=%v", mode)
+	}
+}
+
+// startDTLSListener boots the AnyConnect-DTLS UDS DGRAM consumer when
+// -dtls-uds-socket is set (ADR-F7 Wave IV stream O-S). The listener
+// shares the same iam.Resolver and TUN device as the CSTP path and uses
+// the bridge as its session-lifecycle callback so the /128 lookup picks
+// the DTLS transport for outbound traffic. The DTLS listener runs
+// regardless of the CSTP -mode (uds or legacy) — DTLS termination always
+// happens through the facade-owned shared apex path.
+//
+// Returns (nil, nil) when DTLS is disabled. Returns (nil, err) on bind
+// failure.
+func startDTLSListener(ctx context.Context, cfg config, br *bridge, resolver iam.Resolver, dev *tun.Device) (*dtlsuds.Listener, error) {
+	if cfg.dtlsUDSSocket == "" {
+		slog.Info("dtls listener disabled (no -dtls-uds-socket)")
+		return nil, nil
+	}
+	dtlsLogger := slog.Default().With(slog.String("component", "dtlsuds"))
+	metrics := udshandoff.NewMetrics()
+	l, err := dtlsuds.Listen(ctx, dtlsuds.Options{
+		SocketPath: cfg.dtlsUDSSocket,
+		Resolver:   resolver,
+		Sink:       newTunSink(br, dev),
+		Lifecycle:  br,
+		Logger:     dtlsLogger,
+		Metrics:    metrics,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dtlsuds.Listen: %w", err)
+	}
+	slog.Info("dtls listener bound", "socket", l.SocketPath())
+	return l, nil
+}
+
+// runUDS is the ADR-F7 Stage 2 path: era-facade hands us plaintext UDS
+// streams pre-TLS-decrypted, with the validated client-cert Subject DN
+// in TLV form. No own TLS, no own loopback TCP listener.
+func runUDS(ctx context.Context, cfg config, srv *cstp.Server) error {
+	metrics := udshandoff.NewMetrics()
+	udsLogger := slog.Default().With(slog.String("component", "udsserve"))
+	uds, err := udsserve.Listen(ctx, udsserve.Options{
+		SocketPath: cfg.udsSocketPath,
+		Logger:     udsLogger,
+		Metrics:    metrics,
+		Handler:    srv,
+	})
+	if err != nil {
+		return fmt.Errorf("udsserve listen: %w", err)
+	}
+	slog.Info("era-ocserv listening (uds mode)",
+		"socket", uds.SocketPath(),
+		"server_name", cfg.serverName,
+	)
+	go func() {
+		<-ctx.Done()
+		slog.Info("shutdown signal received")
+		// Order matters: cstp.Server.Close terminates any in-flight
+		// hijacked tunnels (their conns close, the per-stream
+		// goroutines in udshandoff unblock). Only then does
+		// udsserve.Close return promptly — otherwise its underlying
+		// udshandoff wg.Wait would block on the hijacked goroutines.
+		srv.Close()
+		if err := uds.Close(); err != nil {
+			slog.Warn("udsserve close failed", "err", err)
+		}
+	}()
+	<-ctx.Done()
+	slog.Info("era-ocserv stopped (uds mode)")
+	return nil
+}
+
+// runLegacy is the pre-cutover loopback TCP+TLS path. Kept operational
+// so a deploy can fall back without rebuilding. Defaults flip to UDS
+// when the facade's socket directory is present.
+func runLegacy(ctx context.Context, cfg config, tlsCfg *tls.Config, srv *cstp.Server) error {
+	ln, err := net.Listen("tcp", cfg.listenAddr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", cfg.listenAddr, err)
+	}
+	tlsLn := tls.NewListener(ln, tlsCfg)
+
+	httpSrv := &http.Server{
+		Handler:           srv,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		slog.Info("shutdown signal received")
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		httpSrv.Shutdown(shutdownCtx)
+		srv.Close()
+	}()
+
+	slog.Info("era-ocserv listening (legacy mode)",
+		"addr", cfg.listenAddr,
+		"server_name", cfg.serverName,
+	)
+	if err := httpSrv.Serve(tlsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("http serve: %w", err)
+	}
+	slog.Info("era-ocserv stopped (legacy mode)")
+	return nil
+}
+
+func setupLogger(level string) error {
+	var lvl slog.Level
+	switch strings.ToLower(level) {
+	case "debug":
+		lvl = slog.LevelDebug
+	case "info":
+		lvl = slog.LevelInfo
+	case "warn":
+		lvl = slog.LevelWarn
+	case "error":
+		lvl = slog.LevelError
+	default:
+		return fmt.Errorf("unknown log level: %s", level)
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})))
+	return nil
+}
+
+// requireFlags validates that the flags this mode actually consumes are
+// non-empty. UDS-mode skips the TLS triple because era-facade
+// does that work upstream.
+func requireFlags(cfg config, mode listenerMode) error {
+	missing := []string{}
+	if mode == modeLegacy {
+		if cfg.tlsCertPath == "" {
+			missing = append(missing, "-tls-cert")
+		}
+		if cfg.tlsKeyPath == "" {
+			missing = append(missing, "-tls-key")
+		}
+	}
+	if cfg.portalURL == "" {
+		missing = append(missing, "-era-portal-url")
+	}
+	if cfg.portalToken == "" {
+		missing = append(missing, "-era-portal-token")
+	}
+	if cfg.tpmURL == "" {
+		missing = append(missing, "-tpm-url")
+	}
+	if cfg.tpmToken == "" {
+		missing = append(missing, "-tpm-token")
+	}
+	if mode == modeUDS && cfg.udsSocketPath == "" {
+		missing = append(missing, "-uds-socket")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("required flags missing (mode=%s): %s", mode, strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func loadTLS(cfg config) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(cfg.tlsCertPath, cfg.tlsKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load keypair: %w", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"http/1.1"},
+	}, nil
+}
+
+func openTun(cfg config) (*tun.Device, error) {
+	opts := tun.Options{
+		Name:   cfg.tunName,
+		MTU:    cfg.tunMTU,
+		Queues: cfg.tunQueues,
+	}
+	if cfg.tunIPv6 != "" {
+		prefix, err := netip.ParsePrefix(cfg.tunIPv6)
+		if err != nil {
+			return nil, fmt.Errorf("parse tun-ipv6: %w", err)
+		}
+		opts.IPv6 = prefix
+	}
+	return tun.Open(opts)
+}
+
+func parseDNS(s string) ([]netip.Addr, error) {
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]netip.Addr, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		a, err := netip.ParseAddr(p)
+		if err != nil {
+			return nil, fmt.Errorf("bad dns addr %q: %w", p, err)
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+type resolverAdapter struct {
+	inner iam.Resolver
+}
+
+func (r resolverAdapter) Resolve(ctx context.Context, deviceID string) (cstp.Identity, error) {
+	id, err := r.inner.Resolve(ctx, deviceID)
+	if err != nil {
+		return cstp.Identity{}, err
+	}
+	return cstp.Identity{
+		DeviceID:     id.DeviceID,
+		IPv6:         id.IPv6,
+		IPv6CLAT:     id.IPv6CLAT,
+		MTU:          id.MTU,
+		DTLSDisabled: id.DTLSDisabled,
+	}, nil
+}
+
+func sharedEdgeDTLSBindingSource(r *http.Request, id cstp.Identity) (cstp.DTLSBinding, bool) {
+	info, ok := udsserve.FromContext(r.Context())
+	if !ok || info == nil {
+		return cstp.DTLSBinding{}, false
+	}
+	if !info.ClientSrc.Addr().IsValid() || info.SubjectDN == "" || info.UserID == "" || !info.SourceHintV6.IsValid() || len(info.Token) != 12 {
+		return cstp.DTLSBinding{}, false
+	}
+	var token [12]byte
+	copy(token[:], info.Token)
+	// The DTLS data path (internal/dtlsuds) re-resolves the device from the
+	// binding's Subject DN CN. On the AnyConnect password path the facade holds
+	// no client cert and forwards a PLACEHOLDER Subject DN (e.g.
+	// CN=dev_aaaa...26), which is not a real device — resolving it fails with
+	// "device not found in TPM". Carry the REAL resolved device id here instead:
+	// it is the exact value the TPM resolver and the CSTP path (connect.go) key
+	// on. Fall back to the forwarded DN only if the resolved id is unset.
+	subjectDN := info.SubjectDN
+	if id.DeviceID != "" {
+		subjectDN = "CN=" + id.DeviceID
+	}
+	return cstp.DTLSBinding{
+		SourceIP:      info.ClientSrc.Addr().Unmap(),
+		DeviceID:      id.DeviceID,
+		UserID:        info.UserID,
+		MTLSSubjectDN: subjectDN,
+		SourceV6:      info.SourceHintV6,
+		Token:         token,
+	}, true
 }
