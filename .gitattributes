@@ -1,0 +1,4 @@
+# Deploy artifacts run on the Linux data-plane host; shell scripts and the
+# systemd unit must be LF regardless of the checkout platform.
+deploy/*.sh      text eol=lf
+deploy/*.service text eol=lf

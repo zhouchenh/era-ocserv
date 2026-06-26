@@ -1,0 +1,19 @@
+[Unit]
+Description=ERA AnyConnect gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/era-ocserv-launch.sh
+# Ensure the inner-v4 (CLAT/SIIT) TCP-MSS clamp on every start. Idempotent and
+# exits 0 if the shared era_nat64 table is absent, so it never blocks startup.
+ExecStartPost=/usr/local/bin/era-ocserv-mss-clamp.sh
+Restart=on-failure
+RestartSec=5s
+# CAP_NET_ADMIN: tun create/up + addr/route + nft clamp. CAP_NET_RAW: /dev/net/tun.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target
