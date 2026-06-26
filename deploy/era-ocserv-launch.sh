@@ -8,8 +8,8 @@
 # 2/INVALIDARGUMENT on start. Do NOT reintroduce them.
 #
 # The inner-v4 CLAT (SIIT) needs NO launch flag: each device's CLAT-source /128
-# arrives per-session from the tpm client-config (source_ipv6_ocserv_clat) via
-# the iam resolver.
+# arrives per-session from the tpm client-config (source_ipv6_clat preferred;
+# source_ipv6_ocserv_clat accepted during rollout) via the iam resolver.
 #
 # -tun-mtu 1420: LOCKED L3 MTU model per DEC-l3-mtu-model (_program/DECISION_LOG.md).
 # This is the SERVER-SIDE tun MTU only. The WIRE advertised to the client is ALWAYS

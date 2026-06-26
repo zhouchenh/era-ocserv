@@ -35,8 +35,9 @@ func TestConnectPerDeviceDTLSOptOut(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ip := netip.MustParsePrefix("2001:470:f9d1:9001:dead:beef::1/128")
+			clat := netip.MustParsePrefix("2001:470:f9d1:9001:c1a7::1/128")
 			v := &stubVerifier{user: "alice", pass: "hunter2", deviceID: "dev-001"}
-			r := &stubResolver{want: Identity{DeviceID: "dev-001", IPv6: ip, MTU: 1406, DTLSDisabled: tc.dtlsDisabled}}
+			r := &stubResolver{want: Identity{DeviceID: "dev-001", IPv6: ip, IPv6CLAT: clat, MTU: 1406, DTLSDisabled: tc.dtlsDisabled}}
 			inst := &stubDTLSInstaller{}
 			rnd := &fixedRand{src: []byte("01234567890abcdefABCDEFxyzwQRSTuvi.PQR_")}
 			s := NewServer(Config{

@@ -29,7 +29,8 @@
 //   - A CLAT-enabled AnyConnect device also advertises source_ipv6_clat
 //     (preferred, current TPM main) or source_ipv6_ocserv_clat (legacy
 //     deployed TPM branch). The resolver accepts both and prefers the shared
-//     source_ipv6_clat field.
+//     source_ipv6_clat field. One of these fields is required for the current
+//     convergence release; missing CLAT source is ErrNoTunnel.
 //
 // Subject to revision: the endpoint path or response shape may evolve when
 // the era-ocserv tpmctl subcommands land (a separate agent's work). If a

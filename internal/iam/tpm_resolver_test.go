@@ -37,6 +37,7 @@ type fakeClientConfig struct {
 	SourceIPv6Ocserv     string `json:"source_ipv6_ocserv,omitempty"`
 	SourceIPv6OcservClat string `json:"source_ipv6_ocserv_clat,omitempty"`
 	OcservDTLSDisabled   bool   `json:"ocserv_dtls_disabled,omitempty"`
+	ForceNoCLAT          bool   `json:"-"`
 	// other fields elided
 }
 
@@ -234,24 +235,22 @@ func TestTPMResolverDecodesOcservDTLSDisabled(t *testing.T) {
 	}
 }
 
-func TestTPMResolverToleratesAbsentCLAT(t *testing.T) {
-	// CLAT disabled: no source_ipv6_ocserv_clat. The native /128 resolves and
-	// IPv6CLAT stays zero (the session runs v6-only).
+func TestTPMResolverRejectsAbsentCLAT(t *testing.T) {
+	// The convergence release requires a CLAT source /128. Accepting a native
+	// ocserv /128 without a matching CLAT /128 would still let CSTP advertise
+	// the client IPv4 placeholder, but the bridge would have no SIIT source.
 	r, _ := newTestResolver(t, func(w http.ResponseWriter, req *http.Request) {
 		assertAuth(t, req)
 		writeFakeConfig(t, w, fakeClientConfig{
 			SchemaVersion:    2,
 			DeviceID:         testDeviceID,
 			SourceIPv6Ocserv: "2001:470:f9d1:9001:0c5e:7777::9/128",
+			ForceNoCLAT:      true,
 		})
 	}, nil)
 
-	id, err := r.Resolve(context.Background(), testDeviceID)
-	if err != nil {
-		t.Fatalf("Resolve err = %v", err)
-	}
-	if id.IPv6CLAT.IsValid() {
-		t.Errorf("IPv6CLAT = %v, want zero (CLAT disabled)", id.IPv6CLAT)
+	if _, err := r.Resolve(context.Background(), testDeviceID); !errors.Is(err, ErrNoTunnel) {
+		t.Fatalf("err = %v, want ErrNoTunnel", err)
 	}
 }
 
@@ -704,11 +703,23 @@ func TestTPMResolverImplementsResolver(t *testing.T) {
 
 func writeFakeConfig(t *testing.T, w http.ResponseWriter, c fakeClientConfig) {
 	t.Helper()
+	if c.SourceIPv6CLAT == "" && c.SourceIPv6OcservClat == "" && !c.ForceNoCLAT {
+		c.SourceIPv6CLAT = defaultTestCLAT(c)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(c); err != nil {
 		t.Errorf("encode fake config: %v", err)
 	}
+}
+
+func defaultTestCLAT(c fakeClientConfig) string {
+	for _, prefix := range []string{c.SourceIPv6Ocserv, c.SourceIPv6Native} {
+		if strings.HasPrefix(prefix, "2001:db8:") || strings.HasPrefix(prefix, "2001:db8::") {
+			return "2001:db8::c1a7/128"
+		}
+	}
+	return "2001:470:f9d1:9001:c1a7::1/128"
 }
 
 // fakeClock is a tiny test clock used to drive cache expiry deterministically.

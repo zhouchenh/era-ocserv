@@ -79,9 +79,9 @@ func TestBridge_DoubleKeyRegistry(t *testing.T) {
 	}
 }
 
-// TestBridge_NoCLATKeyWhenDisabled confirms a device without a CLAT /128 is
-// registered under only the native key and gets no translator (the
-// unchanged v6-only path).
+// TestBridge_NoCLATKeyWhenDisabled confirms the lower bridge helper does not
+// install a translator from a zero CLAT /128. Production TPMResolver identities
+// fail closed earlier when the CLAT source is missing.
 func TestBridge_NoCLATKeyWhenDisabled(t *testing.T) {
 	b := newBridge(nil, nil)
 	native := netip.MustParseAddr("2001:470:f9d1:9001:0c5e:7777::9")

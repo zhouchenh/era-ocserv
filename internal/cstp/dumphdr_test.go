@@ -25,6 +25,7 @@ func TestConnectResponseHeaderCasing(t *testing.T) {
 	id := Identity{
 		DeviceID: "dev-test",
 		IPv6:     netip.MustParsePrefix("2001:470:f9d1:9001:3223:bcff:fb47:7a53/128"),
+		IPv6CLAT: netip.MustParsePrefix("2001:470:f9d1:9001:c1a7::1/128"),
 		MTU:      1390,
 	}
 	h := make(http.Header)
@@ -61,5 +62,24 @@ func TestConnectResponseHeaderCasing(t *testing.T) {
 		if strings.Contains(wire, bad) {
 			t.Errorf("mis-cased token leaked onto wire: %q", bad)
 		}
+	}
+}
+
+func TestEmitCSTPHeadersSuppressesIPv4LeaseWithoutCLAT(t *testing.T) {
+	id := Identity{
+		DeviceID: "dev-test",
+		IPv6:     netip.MustParsePrefix("2001:470:f9d1:9001:3223:bcff:fb47:7a53/128"),
+	}
+	h := make(http.Header)
+	emitCSTPHeaders(h, Config{DefaultMTU: 1400}, id, 1400)
+
+	if got := h.Get("X-CSTP-Address"); got != "" {
+		t.Fatalf("X-CSTP-Address = %q, want absent without CLAT /128", got)
+	}
+	if got := h.Get("X-CSTP-Netmask"); got != "" {
+		t.Fatalf("X-CSTP-Netmask = %q, want absent without CLAT /128", got)
+	}
+	if got := h.Get("X-CSTP-Address-IP6"); got == "" {
+		t.Fatalf("X-CSTP-Address-IP6 missing; v6 lease should remain")
 	}
 }

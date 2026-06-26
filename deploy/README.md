@@ -8,7 +8,8 @@ are never touched.
 ## Files
 - `era-ocserv-launch.sh` → `/usr/local/bin/era-ocserv-launch.sh` — UDS-mode launch,
   metrics-clean (no `-metrics-*`; those crash start). No CLAT flag needed — the
-  CLAT-source /128 is per-device via the tpm client-config (`source_ipv6_ocserv_clat`).
+  CLAT-source /128 is per-device via the tpm client-config (`source_ipv6_clat`
+  preferred, `source_ipv6_ocserv_clat` accepted during rollout).
 - `era-ocserv-mss-clamp.sh` → `/usr/local/bin/era-ocserv-mss-clamp.sh` — idempotent;
   adds `era-ocserv-tun` to the host TCP-MSS clamp (`inet era_nat64` forward chain)
   so inner-v4 large TCP does not blackhole.

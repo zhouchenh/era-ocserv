@@ -294,15 +294,17 @@ func (r *TPMResolver) fetch(ctx context.Context, deviceID string) (Identity, err
 		clatPrefix = strings.TrimSpace(raw.SourceIPv6OcservClat)
 		clatField = "source_ipv6_ocserv_clat"
 	}
-	// An empty value means CLAT is disabled for this device (the session runs
-	// v6-only); only a present-but-malformed value is an error.
-	if clatPrefix != "" {
-		clatP, clatErr := r.validatePoolHost128(clatField, clatPrefix)
-		if clatErr != nil {
-			return Identity{}, clatErr
-		}
-		id.IPv6CLAT = clatP
+	if clatPrefix == "" {
+		// The CSTP profile always includes the client-side CLAT IPv4 when
+		// CLAT is available. Without the matching source /128, raw IPv4 could
+		// reach the TUN without SIIT, so fail closed for this convergence line.
+		return Identity{}, fmt.Errorf("%w: missing source_ipv6_clat/source_ipv6_ocserv_clat", ErrNoTunnel)
 	}
+	clatP, clatErr := r.validatePoolHost128(clatField, clatPrefix)
+	if clatErr != nil {
+		return Identity{}, clatErr
+	}
+	id.IPv6CLAT = clatP
 
 	return id, nil
 }

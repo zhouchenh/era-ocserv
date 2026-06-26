@@ -317,15 +317,15 @@ func emitCSTPHeaders(h http.Header, cfg Config, id Identity, innerMTU int) {
 		h.Set("X-CSTP-Address-IP6", id.IPv6.Addr().String()+"/128")
 	}
 
-	// CLAT inner source: every client receives the same inner IPv4. era-ocserv's
-	// stateless SIIT data plane (internal/clatxlat) translates this inner v4
-	// to/from 64:ff9b::<v4dst> sourced from the device's CLAT /128. We advertise
-	// the RFC 7335 §4 standard CLAT address 192.0.0.1/32 (see ClatPlaceholderV4).
-	// NOTE: on a 464XLAT carrier the iOS system CLAT may itself bind 192.0.0.1 —
-	// historically suspected to cause a duplicate-address reassert, but that was
-	// observed via the facade (which looped independently); validating here.
-	h.Set("X-CSTP-Address", ClatPlaceholderV4.String())
-	h.Set("X-CSTP-Netmask", ClatPlaceholderV4Netmask)
+	if id.IPv6CLAT.IsValid() {
+		// CLAT inner source: every CLAT-enabled client receives the same inner
+		// IPv4. era-ocserv's stateless SIIT data plane (internal/clatxlat)
+		// translates this inner v4 to/from 64:ff9b::<v4dst> sourced from the
+		// device's CLAT /128. We advertise the RFC 7335 §4 standard CLAT
+		// address 192.0.0.1/32 (see ClatPlaceholderV4).
+		h.Set("X-CSTP-Address", ClatPlaceholderV4.String())
+		h.Set("X-CSTP-Netmask", ClatPlaceholderV4Netmask)
+	}
 
 	if cfg.ServerName != "" {
 		h.Set("X-CSTP-Hostname", cfg.ServerName)

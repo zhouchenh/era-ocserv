@@ -54,11 +54,13 @@ func (s *stubResolver) Resolve(_ context.Context, deviceID string) (Identity, er
 func freshServer(t *testing.T) (*Server, *stubVerifier, *stubResolver) {
 	t.Helper()
 	ip := netip.MustParsePrefix("2001:470:f9d1:9001:dead:beef::1/128")
+	clat := netip.MustParsePrefix("2001:470:f9d1:9001:c1a7::1/128")
 	v := &stubVerifier{user: "alice", pass: "hunter2", deviceID: "dev-001"}
 	r := &stubResolver{
 		want: Identity{
 			DeviceID: "dev-001",
 			IPv6:     ip,
+			IPv6CLAT: clat,
 			MTU:      1406,
 		},
 	}

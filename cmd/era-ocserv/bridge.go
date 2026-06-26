@@ -93,9 +93,7 @@ func (a *activeClient) translator() *clatxlat.Translator {
 // engine maps it to/from the device's CLAT-source /128. It is the SAME value
 // advertised on the wire as X-CSTP-Address (cstp.ClatPlaceholderV4) so the
 // client's inner v4 source and the translator's expected source can never
-// drift. NOTE: it is intentionally NOT 192.0.0.1 — that collides with the iOS
-// system CLAT address on 464XLAT carriers and makes the client reassert; see
-// cstp.ClatPlaceholderV4 / emitCSTPHeaders.
+// drift.
 var placeholderClatV4 = cstp.ClatPlaceholderV4
 
 type bridge struct {
@@ -307,8 +305,9 @@ func (b *bridge) pumpTunnel(ctx context.Context, t *cstp.Tunnel) {
 		// no longer steal this client's downloads the moment we clear it here.
 		slog.Warn("detaching stale DTLS session on fresh CSTP connect", "device", id.DeviceID, "inner", inner)
 	}
-	// Build the per-session translator + CLAT /128 key (no-op without a
-	// CLAT /128 → today's v6-only behavior).
+	// Build the per-session translator + CLAT /128 key. Production identities
+	// from TPMResolver must include the CLAT /128; a zero value here is only
+	// tolerated for lower-level tests or future explicit v6-only plumbing.
 	var clatV6 netip.Addr
 	if id.IPv6CLAT.IsValid() {
 		clatV6 = id.IPv6CLAT.Addr()

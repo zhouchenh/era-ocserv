@@ -54,8 +54,8 @@ type Identity struct {
 	// the client's inner-IPv4 (placeholder 192.0.0.1) egresses as
 	// 64:ff9b::<v4dst> sourced from this address; the same *activeClient is
 	// also registered under this /128 so 64:ff9b:: replies route back. An
-	// invalid (zero) value means CLAT is disabled and the session runs
-	// v6-only. The address, when valid, is a /128 inside the pool.
+	// invalid (zero) value suppresses the IPv4 lease in CSTP headers. The
+	// address, when valid, is a /128 inside the pool.
 	IPv6CLAT netip.Prefix
 	// MTU is the inner-frame MTU advertised via X-CSTP-MTU. If zero the
 	// server falls back to Config.DefaultMTU.
