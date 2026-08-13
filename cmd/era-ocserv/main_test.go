@@ -216,6 +216,23 @@ func TestLegacyHandlerBindsCertificateAndPortalDevice(t *testing.T) {
 	}
 }
 
+func TestVerifierForModeScopesCertificateBindingToLegacy(t *testing.T) {
+	raw := &auth.MockVerifier{}
+
+	legacy, ok := verifierForMode(modeLegacy, raw).(certBoundVerifier)
+	if !ok {
+		t.Fatal("legacy verifier is not certificate-bound")
+	}
+	if legacy.inner != raw {
+		t.Fatal("legacy verifier does not wrap the raw portal verifier")
+	}
+
+	uds := verifierForMode(modeUDS, raw)
+	if uds != raw {
+		t.Fatal("UDS verifier was globally wrapped; want the raw portal verifier")
+	}
+}
+
 func legacyAuthReply(opaque, username, password string) string {
 	return `<config-auth client="vpn" type="auth-reply"><opaque is-for="sg"><session-id>` + opaque + `</session-id></opaque><auth><username>` + username + `</username><password>` + password + `</password></auth></config-auth>`
 }

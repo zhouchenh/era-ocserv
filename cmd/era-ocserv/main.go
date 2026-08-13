@@ -226,7 +226,7 @@ func run() error {
 	}
 
 	srv := cstp.NewServer(cstp.Config{
-		Verifier:             certBoundVerifier{inner: hv},
+		Verifier:             verifierForMode(mode, hv),
 		Resolver:             resolverAdapter{inner: tpmResolver},
 		ServerName:           cfg.serverName,
 		ServerCertSHA1:       cfg.serverCertSHA1,
@@ -473,6 +473,13 @@ func certMiddleware(cv *auth.CertValidator, next http.Handler) http.Handler {
 
 type certBoundVerifier struct {
 	inner auth.PasswordVerifier
+}
+
+func verifierForMode(mode listenerMode, verifier auth.PasswordVerifier) auth.PasswordVerifier {
+	if mode == modeLegacy {
+		return certBoundVerifier{inner: verifier}
+	}
+	return verifier
 }
 
 func (v certBoundVerifier) Verify(ctx context.Context, username, password string) (string, error) {
