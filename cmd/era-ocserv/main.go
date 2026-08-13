@@ -76,7 +76,7 @@ func parseFlags() config {
 	flag.IntVar(&c.tunMTU, "tun-mtu", 1500, "tun MTU")
 	flag.IntVar(&c.tunQueues, "tun-queues", 0, "tun queue count (0 = default min(NumCPU, 4))")
 	flag.StringVar(&c.tunIPv6, "tun-ipv6", "", "tun's own /128 IPv6 (e.g. 2001:470:f9d1:9001:ffff::1/128); empty leaves unset")
-	flag.StringVar(&c.serverName, "server-name", "vpn.eracloud.app", "SNI / server name advertised in CSTP")
+	flag.StringVar(&c.serverName, "server-name", "eracloud.app", "server name advertised in CSTP")
 	flag.StringVar(&c.dnsServers, "dns", "2606:4700:4700::1111,2606:4700:4700::1001", "comma-separated DNS servers pushed via X-CSTP-DNS")
 	flag.StringVar(&c.defaultDomain, "default-domain", "", "DNS default domain pushed via X-CSTP-Default-Domain")
 	flag.StringVar(&c.logLevel, "log-level", "info", "log level: debug|info|warn|error")
@@ -244,7 +244,7 @@ func run() error {
 // the bridge as its session-lifecycle callback so the /128 lookup picks
 // the DTLS transport for outbound traffic. The DTLS listener runs
 // regardless of the CSTP -mode (uds or legacy) — DTLS termination always
-// happens at the facade in ADR-F7 Stage 5.
+// happens through the facade-owned shared apex path.
 //
 // Returns (nil, nil) when DTLS is disabled. Returns (nil, err) on bind
 // failure.
@@ -419,42 +419,6 @@ func loadTLS(cfg config) (*tls.Config, error) {
 	}, nil
 }
 
-func openTun(cfg config) (*tun.Device, error) {
-	opts := tun.Options{
-		Name:   cfg.tunName,
-		MTU:    cfg.tunMTU,
-		Queues: cfg.tunQueues,
-	}
-	if cfg.tunIPv6 != "" {
-		prefix, err := netip.ParsePrefix(cfg.tunIPv6)
-		if err != nil {
-			return nil, fmt.Errorf("parse tun-ipv6: %w", err)
-		}
-		opts.IPv6 = prefix
-	}
-	return tun.Open(opts)
-}
-
-func parseDNS(s string) ([]netip.Addr, error) {
-	if s == "" {
-		return nil, nil
-	}
-	parts := strings.Split(s, ",")
-	out := make([]netip.Addr, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		a, err := netip.ParseAddr(p)
-		if err != nil {
-			return nil, fmt.Errorf("bad dns addr %q: %w", p, err)
-		}
-		out = append(out, a)
-	}
-	return out, nil
-}
-
 // certMiddleware is the legacy-mode (loopback TCP+TLS) cert handler. It
 // extracts the device id from the live TLS state, then stores it on the
 // request context via certctx for the certBoundVerifier downstream.
@@ -497,6 +461,42 @@ func (v certBoundVerifier) Verify(ctx context.Context, username, password string
 		return "", auth.ErrBadCredentials
 	}
 	return certID, nil
+}
+
+func openTun(cfg config) (*tun.Device, error) {
+	opts := tun.Options{
+		Name:   cfg.tunName,
+		MTU:    cfg.tunMTU,
+		Queues: cfg.tunQueues,
+	}
+	if cfg.tunIPv6 != "" {
+		prefix, err := netip.ParsePrefix(cfg.tunIPv6)
+		if err != nil {
+			return nil, fmt.Errorf("parse tun-ipv6: %w", err)
+		}
+		opts.IPv6 = prefix
+	}
+	return tun.Open(opts)
+}
+
+func parseDNS(s string) ([]netip.Addr, error) {
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]netip.Addr, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		a, err := netip.ParseAddr(p)
+		if err != nil {
+			return nil, fmt.Errorf("bad dns addr %q: %w", p, err)
+		}
+		out = append(out, a)
+	}
+	return out, nil
 }
 
 type resolverAdapter struct {

@@ -23,21 +23,20 @@ These are dependencies the caller injects through `Config` (`Verifier`,
 `Resolver`) or wires up at the integration layer (the listener, TLS or UDS).
 
 - TLS termination (legacy mode: `cmd/era-ocserv` owns it; UDS mode: the facade
-  owns it).
-- mTLS client-certificate validation (legacy: `internal/auth.CertValidator`;
-  UDS: `auth.DeviceIDFromSubjectDN` against the TLV value).
-- Password verification (`internal/auth.HTTPVerifier` → era-portal).
+  owns it on the shared `eracloud.app:443` edge).
+- Device-credential verification (`internal/auth.HTTPVerifier` → era-portal).
 - IPv6 prefix / MTU resolution (`internal/iam.TPMResolver` → tpm).
 - The host tun device (`internal/tun` + `cmd/era-ocserv/bridge`).
 
 ## Two listener modes
 
-### Legacy: loopback TCP + TLS (pre-cutover)
+### Legacy: loopback TCP + TLS (pre-cutover compatibility)
 
-era-ocserv listens on `127.0.0.1:8444` (the historical default), terminates TLS
-itself, and validates the client cert via `internal/auth.CertValidator`. The
-extracted device id is stored on `certctx` for the downstream password verifier
-to cross-check.
+era-ocserv listens on `127.0.0.1:8444` (the historical default) and terminates
+TLS itself. The listener requires and verifies a client certificate signed by
+the configured `-client-ca`; the certificate's CN supplies the device ID.
+The password verifier response must return the same device ID, so a valid
+portal credential cannot be used with a different device certificate.
 
 This path is kept operational so a Wave II deploy can fall back without
 rebuilding. It is selected by `-mode=legacy` or `-mode=auto` on a host whose
@@ -50,20 +49,18 @@ client ──TLS+mTLS── era-ocserv:8444 ──┐
                                               └─ CONNECT (binary tunnel)
 ```
 
-### UDS: facade-terminated TLS + plaintext handoff (ADR-F7 Stage 2)
+### UDS: facade-terminated TLS + plaintext handoff (shipping shared-apex path)
 
-era-facade owns `:443`, terminates TLS+mTLS, validates the device cert, and
-hands era-ocserv a plaintext UDS stream with the device cert's Subject DN
-carried in `ERA_TLV_MTLS_SUBJECT_DN` (0xED). era-ocserv extracts the device id
-from the DN's CN, runs the same CSTP HTTP handler chain, and emits a CONNECT
-response onto the plaintext stream. The facade re-encrypts the response and
-relays to the client.
+era-facade owns `eracloud.app:443`, terminates TLS, validates the token-prefixed
+URL at `/drive/access/<token>/*`, and hands era-ocserv a plaintext UDS stream.
+era-ocserv then runs the normal CSTP HTTP handler chain and asks era-portal to
+verify `username=dev_...` plus the per-device AnyConnect setup secret.
 
 ```
-client ──TLS+mTLS── facade ──UDS+PROXY-v2+TLVs── era-ocserv ──┐
-                                                              └─► cstp.Server.ServeHTTP
-                                                                    ├─ init / auth
-                                                                    └─ CONNECT (binary tunnel)
+client ──TLS── facade ──UDS+PROXY-v2+TLVs── era-ocserv ──┐
+                                                          └─► cstp.Server.ServeHTTP
+                                                                ├─ init / auth
+                                                                └─ CONNECT (binary tunnel)
 ```
 
 Wire spec for the UDS hop:
@@ -76,11 +73,9 @@ directory of `-uds-socket` (default
 
 ## DTLS
 
-Out of scope for Wave II. ADR-F7 Stage 5 lifts DTLS termination into the
-facade; era-ocserv stays a plaintext consumer. The `X-DTLS-*` advertisement
-emitted by `handleConnect` still runs in legacy mode (it derives the PSK via
-the TLS exporter) and silently downgrades to TCP-only when no `r.TLS` is
-present — which is the case under UDS mode in Wave II. Stage 5 will replace
-that downgrade with a DTLS UDS-DGRAM consumer; see
-`docs/decisions/0057-era-ocserv-architecture.md` (TODO: amendment landing in
-the Stage 5 PR).
+The DTLS UDS-DGRAM consumer exists in-tree and is started by `cmd/era-ocserv`
+when `-dtls-uds-socket` is set, but the facade-owned shared-apex DTLS binding
+path is still incomplete. As a result, the `X-DTLS-*` advertisement remains
+honest only where era-ocserv still has access to the outer TLS session. Shared-
+apex deployments should currently treat CSTP-over-TLS as the ready path and
+DTLS as follow-up integration work.
