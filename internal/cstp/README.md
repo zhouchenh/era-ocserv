@@ -33,14 +33,17 @@ These are dependencies the caller injects through `Config` (`Verifier`,
 ### Legacy: loopback TCP + TLS (pre-cutover compatibility)
 
 era-ocserv listens on `127.0.0.1:8444` (the historical default) and terminates
-TLS itself.
+TLS itself. The listener requires and verifies a client certificate signed by
+the configured `-client-ca`; the certificate's CN supplies the device ID.
+The password verifier response must return the same device ID, so a valid
+portal credential cannot be used with a different device certificate.
 
 This path is kept operational so a Wave II deploy can fall back without
 rebuilding. It is selected by `-mode=legacy` or `-mode=auto` on a host whose
 facade UDS directory is absent.
 
 ```
-client ──TLS── era-ocserv:8444 ──┐
+client ──TLS+mTLS── era-ocserv:8444 ──┐
                                        └─► cstp.Server.ServeHTTP
                                               ├─ init / auth (POSTs)
                                               └─ CONNECT (binary tunnel)
