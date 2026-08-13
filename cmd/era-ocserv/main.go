@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/zhouchenh/era-ocserv/internal/auth"
+	"github.com/zhouchenh/era-ocserv/internal/certctx"
 	"github.com/zhouchenh/era-ocserv/internal/cstp"
 	"github.com/zhouchenh/era-ocserv/internal/dtlsuds"
 	"github.com/zhouchenh/era-ocserv/internal/iam"
@@ -152,12 +154,17 @@ func run() error {
 
 	var (
 		tlsCfg *tls.Config
+		cv     *auth.CertValidator
 	)
 	if mode == modeLegacy {
 		tlsCfg, err = loadTLS(cfg)
 		if err != nil {
 			return fmt.Errorf("load TLS: %w", err)
 		}
+		cv = auth.NewCertValidator(auth.CertValidatorConfig{
+			ClientCAs:    tlsCfg.ClientCAs,
+			SubjectField: "CN",
+		})
 	}
 
 	dev, err := openTun(cfg)
@@ -191,7 +198,7 @@ func run() error {
 	}
 
 	srv := cstp.NewServer(cstp.Config{
-		Verifier:          hv,
+		Verifier:          certBoundVerifier{inner: hv},
 		Resolver:          resolverAdapter{inner: tpmResolver},
 		ServerName:        cfg.serverName,
 		DNS:               dns,
@@ -225,7 +232,7 @@ func run() error {
 	case modeUDS:
 		return runUDS(ctx, cfg, srv)
 	case modeLegacy:
-		return runLegacy(ctx, cfg, tlsCfg, srv)
+		return runLegacy(ctx, cfg, tlsCfg, cv, srv)
 	default:
 		return fmt.Errorf("unreachable: mode=%v", mode)
 	}
@@ -303,7 +310,7 @@ func runUDS(ctx context.Context, cfg config, srv *cstp.Server) error {
 // runLegacy is the pre-cutover loopback TCP+TLS path. Kept operational
 // so a deploy can fall back without rebuilding. Defaults flip to UDS
 // when the facade's socket directory is present.
-func runLegacy(ctx context.Context, cfg config, tlsCfg *tls.Config, srv *cstp.Server) error {
+func runLegacy(ctx context.Context, cfg config, tlsCfg *tls.Config, cv *auth.CertValidator, srv *cstp.Server) error {
 	ln, err := net.Listen("tcp", cfg.listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", cfg.listenAddr, err)
@@ -311,7 +318,7 @@ func runLegacy(ctx context.Context, cfg config, tlsCfg *tls.Config, srv *cstp.Se
 	tlsLn := tls.NewListener(ln, tlsCfg)
 
 	httpSrv := &http.Server{
-		Handler:           srv,
+		Handler:           certMiddleware(cv, srv),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -354,7 +361,7 @@ func setupLogger(level string) error {
 }
 
 // requireFlags validates that the flags this mode actually consumes are
-// non-empty. UDS-mode skips the TLS triple because era-facade
+// non-empty. UDS-mode skips the TLS+clientCA triple because era-facade
 // does that work upstream.
 func requireFlags(cfg config, mode listenerMode) error {
 	missing := []string{}
@@ -364,6 +371,9 @@ func requireFlags(cfg config, mode listenerMode) error {
 		}
 		if cfg.tlsKeyPath == "" {
 			missing = append(missing, "-tls-key")
+		}
+		if cfg.clientCAPath == "" {
+			missing = append(missing, "-client-ca")
 		}
 	}
 	if cfg.portalURL == "" {
@@ -392,11 +402,65 @@ func loadTLS(cfg config) (*tls.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load keypair: %w", err)
 	}
+	caPEM, err := os.ReadFile(cfg.clientCAPath)
+	if err != nil {
+		return nil, fmt.Errorf("read client CA: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("no certs parsed from %s", cfg.clientCAPath)
+	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    pool,
 		MinVersion:   tls.VersionTLS12,
 		NextProtos:   []string{"http/1.1"},
 	}, nil
+}
+
+// certMiddleware is the legacy-mode (loopback TCP+TLS) cert handler. It
+// extracts the device id from the live TLS state, then stores it on the
+// request context via certctx for the certBoundVerifier downstream.
+//
+// UDS-mode does the equivalent extraction earlier, from
+// `ERA_TLV_MTLS_SUBJECT_DN`, and uses the same certctx key — see
+// internal/udsserve.
+func certMiddleware(cv *auth.CertValidator, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			http.Error(w, "TLS required", http.StatusBadRequest)
+			return
+		}
+		deviceID, err := cv.Validate(*r.TLS)
+		if err != nil {
+			slog.Warn("cert validate failed", "err", err, "remote", r.RemoteAddr)
+			http.Error(w, "client cert required", http.StatusUnauthorized)
+			return
+		}
+		ctx := certctx.WithDeviceID(r.Context(), deviceID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+type certBoundVerifier struct {
+	inner auth.PasswordVerifier
+}
+
+func (v certBoundVerifier) Verify(ctx context.Context, username, password string) (string, error) {
+	certID, ok := certctx.FromContext(ctx)
+	if !ok {
+		return "", errors.New("internal: no cert deviceID in context")
+	}
+	pwID, err := v.inner.Verify(ctx, username, password)
+	if err != nil {
+		return "", err
+	}
+	if pwID != certID {
+		slog.Warn("cert/password deviceID mismatch", "cert_id", certID, "pw_id", pwID)
+		return "", auth.ErrBadCredentials
+	}
+	return certID, nil
 }
 
 func openTun(cfg config) (*tun.Device, error) {
