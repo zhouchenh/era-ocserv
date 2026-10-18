@@ -241,11 +241,11 @@ func (r *TPMResolver) fetch(ctx context.Context, deviceID string) (Identity, err
 	// We deliberately decode only the fields we need so an additive change
 	// upstream does not break us; UnknownFields are tolerated.
 	var raw struct {
-		DeviceID             string `json:"device_id"`
-		SourceIPv6Native     string `json:"source_ipv6_native"`
-		SourceIPv6CLAT       string `json:"source_ipv6_clat"`
-		SourceIPv6Ocserv     string `json:"source_ipv6_ocserv"`
-		SourceIPv6OcservClat string `json:"source_ipv6_ocserv_clat"`
+		DeviceID             string          `json:"device_id"`
+		SourceIPv6Native     string          `json:"source_ipv6_native"`
+		SourceIPv6CLAT       string          `json:"source_ipv6_clat"`
+		SourceIPv6Ocserv     string          `json:"source_ipv6_ocserv"`
+		SourceIPv6OcservClat json.RawMessage `json:"source_ipv6_ocserv_clat"`
 		// Per-device DTLS opt-out (CONTRACT field). When true, era-ocserv
 		// advertises no DTLS and the client uses CSTP/TLS (TCP) only. Additive +
 		// optional; absent ⇒ false ⇒ DTLS offered as usual. tpm/era-portal/PWA
@@ -284,15 +284,18 @@ func (r *TPMResolver) fetch(ctx context.Context, deviceID string) (Identity, err
 	}
 
 	// Decode the device's CLAT-source /128 (kind ocserv_clat_ipv6).
-	// Current TPM emits the shared CLAT-source field source_ipv6_clat; the
-	// older live branch emitted the method-specific source_ipv6_ocserv_clat.
-	// Prefer the shared field so this resolver matches current TPM main, but
-	// keep the legacy fallback to avoid breaking a staggered rollout.
+	// Prefer the transport-specific field. The shared field belongs to WG on
+	// dual-bound devices and is only a legacy fallback when explicit data is
+	// absent. Present invalid explicit data must never downgrade to fallback.
 	clatPrefix := strings.TrimSpace(raw.SourceIPv6CLAT)
 	clatField := "source_ipv6_clat"
-	if clatPrefix == "" {
-		clatPrefix = strings.TrimSpace(raw.SourceIPv6OcservClat)
+	if len(raw.SourceIPv6OcservClat) != 0 {
 		clatField = "source_ipv6_ocserv_clat"
+		var explicit string
+		if err := json.Unmarshal(raw.SourceIPv6OcservClat, &explicit); err != nil || strings.TrimSpace(explicit) == "" {
+			return Identity{}, fmt.Errorf("%w: invalid source_ipv6_ocserv_clat", ErrUpstream)
+		}
+		clatPrefix = strings.TrimSpace(explicit)
 	}
 	if clatPrefix == "" {
 		// The CSTP profile always includes the client-side CLAT IPv4 when
