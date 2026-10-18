@@ -180,7 +180,7 @@ func TestTPMResolverDecodesLegacyOcservCLAT(t *testing.T) {
 	}
 }
 
-func TestTPMResolverPrefersSharedCLATOverLegacyCLAT(t *testing.T) {
+func TestTPMResolverPrefersExplicitOcservCLATOverShared(t *testing.T) {
 	r, _ := newTestResolver(t, func(w http.ResponseWriter, req *http.Request) {
 		assertAuth(t, req)
 		writeFakeConfig(t, w, fakeClientConfig{
@@ -196,8 +196,8 @@ func TestTPMResolverPrefersSharedCLATOverLegacyCLAT(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve err = %v", err)
 	}
-	if want := netip.MustParsePrefix("2001:470:f9d1:9001:c1a7::3/128"); id.IPv6CLAT != want {
-		t.Errorf("IPv6CLAT = %v, want shared CLAT /128 %v", id.IPv6CLAT, want)
+	if want := netip.MustParsePrefix("2001:470:f9d1:9001:c1a7::4/128"); id.IPv6CLAT != want {
+		t.Errorf("IPv6CLAT = %v, want explicit ocserv CLAT /128 %v", id.IPv6CLAT, want)
 	}
 }
 

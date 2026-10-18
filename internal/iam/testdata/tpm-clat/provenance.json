@@ -1,0 +1,14 @@
+{
+  "producer_repository": "https://github.com/zhouchenh/tpm",
+  "producer_base": "8277314c0f6bb34ff47aa738eb1ec8734c78dcdb",
+  "producer_tree": "b1dd200d8c66fe31b8cde52ef0907e787b6efc7e",
+  "producer_freeze_sha256": "2adbd0835eb0503fcb462ec7a6ac36f4b25231423ddfb6e4b849c9bc6b48f655",
+  "generator": "internal/provisioning/ocserv_wire_contract_test.go:TestOcservWireContractDualBoundProjection",
+  "command": "CGO_ENABLED=0 TPM_OCSERV_FIXTURE_OUTPUT=<new-directory> go test ./internal/provisioning -run ^TestOcservWireContractDualBoundProjection$ -count=1",
+  "toolchain": "go1.26.3 windows/amd64",
+  "files": {
+    "dual-bound.json": "f9ed4bb28696332b3c47f1fed90f77ecf22ee0e27e99064aeefce144b0fba09d",
+    "ocserv-only.json": "a636cd19a39b2cdea9f709566ebe58c36e397c6e4f529c221db39ee46b517999"
+  },
+  "scope": "Real disposable TPM allocator/ClientConfig serialization, synthetic identities and documentation prefixes only. No key secrets/host action; IDs and timestamps are not deterministic."
+}

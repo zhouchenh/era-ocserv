@@ -1,0 +1,23 @@
+{
+  "schema_version": 3,
+  "generated_at": "2026-10-18T15:54:49Z",
+  "device_id": "dev_xa7myqb2nvj7yh274qw2qjnv7m",
+  "user_id": "usr_242pjzue4s7j3hyxgwwx5bybjy",
+  "username": "era-user",
+  "device_name": "wire-contract",
+  "peer_id": "",
+  "client_public_key": "",
+  "interface": {
+    "addresses": [
+      "2001:db8:1::3/128",
+      "2001:db8:1::4/128",
+      "192.0.0.1/32"
+    ],
+    "dns": []
+  },
+  "peers": [],
+  "source_ipv6_clat": "2001:db8:1::4/128",
+  "source_ipv6_ocserv": "2001:db8:1::3/128",
+  "source_ipv6_ocserv_clat": "2001:db8:1::4/128",
+  "warnings": []
+}
