@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/zhouchenh/era-ocserv/internal/logredact"
 )
 
 // webVPNContextCookie is the session-tracking cookie name stock ocserv uses on
@@ -79,18 +81,13 @@ func parseAuthReply(r *http.Request) (parsedAuth, error) {
 // Android is the one explicit rejection because v1 does not support
 // it.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Diagnostic: log EVERY request's method+path so we can see exactly what an
-	// AnyConnect client sends — in particular whether a group-url sub-path (e.g.
-	// /drive/access/<token>) is prefixed onto the CSTP paths the router matches
-	// exactly. A facade strips that prefix; a standalone listener does not.
-	slog.Debug("cstp request", "method", r.Method, "path", r.URL.Path)
-	// DIAGNOSTIC/COMPAT: a Cisco Secure Client configured with a group-url
-	// (e.g. https://host/drive/access/<token>) sends its FIRST CSTP request to
-	// that full path instead of "/". In production era-facade strips the
-	// /drive/access/<token> prefix before handoff; a standalone listener must do
-	// it itself. Strip a leading /drive/access/<segment> so the exact-path router
-	// matches. Absolute follow-ups (/auth form action, /CSCOSSLC/tunnel) carry no
-	// prefix and are unaffected.
+	// Keep method and route diagnostics without exposing group-URL tokens.
+	slog.Debug("cstp request", "method", r.Method, "path", redactGroupURLTokens(r.URL.Path))
+	// Facade preserves the group URL on sign-in POSTs so auth actions and the
+	// completion base retain it; CONNECT may already have its canonical path.
+	// A standalone listener can also receive group-prefixed requests. Strip the
+	// prefix for exact-path routing and retain it in context for response URLs.
+	// Requests already using canonical paths are unaffected.
 	if strings.HasPrefix(r.URL.Path, "/drive/access/") {
 		full := r.URL.Path
 		rest := full[len("/drive/access/"):]
@@ -109,7 +106,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// absolute path would skip the apex and hit the cover. Stash the group-url
 		// so the form builder + webvpnc directive can prefix accordingly.
 		r = r.WithContext(context.WithValue(r.Context(), groupURLCtxKey{}, groupURL))
-		slog.Debug("cstp group-url prefix stripped", "routed_path", r.URL.Path, "group_url", groupURL)
+		slog.Debug("cstp group-url prefix stripped", "routed_path", redactGroupURLTokens(r.URL.Path), "group_url", redactGroupURLTokens(groupURL))
 	}
 	if ua := r.Header.Get("User-Agent"); rejectAndroidCiscoSC(ua) {
 		http.Error(w, "Cisco Secure Client on Android is not supported; use OpenConnect for Android.", http.StatusForbidden)
@@ -128,9 +125,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && isAnyConnectHousekeepingPath(r.URL.Path):
 		s.handleAnyConnectHousekeeping(w, r)
 	default:
-		slog.Warn("cstp request UNROUTED -> 404", "method", r.Method, "path", r.URL.Path)
+		slog.Warn("cstp request UNROUTED -> 404", "method", r.Method, "path", redactGroupURLTokens(r.URL.Path))
 		http.NotFound(w, r)
 	}
+}
+
+// redactGroupURLTokens removes token segments from diagnostic paths only.
+func redactGroupURLTokens(path string) string {
+	return logredact.GroupURLTokens(path)
 }
 
 // groupURLCtxKey keys the covert group-url prefix (e.g. "/drive/access/<token>")

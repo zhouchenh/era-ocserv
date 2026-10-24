@@ -7,6 +7,7 @@ import (
 
 	"github.com/zhouchenh/era-ocserv/internal/auth"
 	"github.com/zhouchenh/era-ocserv/internal/certctx"
+	"github.com/zhouchenh/era-ocserv/internal/logredact"
 )
 
 // wrapHandler is the per-stream HTTP middleware the UDS bridge inserts
@@ -64,7 +65,7 @@ func wrapHandler(next http.Handler, logger *slog.Logger) http.Handler {
 			slog.String("device_id", deviceID),
 			slog.String("user_id", info.UserID),
 			slog.String("method", r.Method),
-			slog.String("path", r.URL.Path),
+			slog.String("path", logredact.GroupURLTokens(r.URL.Path)),
 		)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
