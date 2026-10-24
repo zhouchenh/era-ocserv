@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/zhouchenh/era-ocserv/internal/logredact"
 )
 
 // webVPNContextCookie is the session-tracking cookie name stock ocserv uses on
@@ -129,15 +131,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // redactGroupURLTokens removes token segments from diagnostic paths only.
-// Preserve the surrounding route, including nested group URLs on unrouted input.
 func redactGroupURLTokens(path string) string {
-	parts := strings.Split(path, "/")
-	for i := 0; i+2 < len(parts); i++ {
-		if parts[i] == "drive" && parts[i+1] == "access" && parts[i+2] != "" {
-			parts[i+2] = "[redacted]"
-		}
-	}
-	return strings.Join(parts, "/")
+	return logredact.GroupURLTokens(path)
 }
 
 // groupURLCtxKey keys the covert group-url prefix (e.g. "/drive/access/<token>")
