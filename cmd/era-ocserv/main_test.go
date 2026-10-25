@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/zhouchenh/era-ocserv/internal/auth"
+	"github.com/zhouchenh/era-ocserv/internal/certctx"
 	"github.com/zhouchenh/era-ocserv/internal/cstp"
 )
 
@@ -216,20 +218,78 @@ func TestLegacyHandlerBindsCertificateAndPortalDevice(t *testing.T) {
 	}
 }
 
-func TestVerifierForModeScopesCertificateBindingToLegacy(t *testing.T) {
+// TestUDSVerifierBindsHandoffDeviceAndPortalDevice is the UDS twin of
+// TestLegacyHandlerBindsCertificateAndPortalDevice. In UDS mode the facade
+// forwards a token-derived MTLS Subject DN whose CN is the token's device;
+// udsserve's middleware places that CN in certctx. A portal credential that
+// belongs to a different device must not complete sign-in.
+func TestUDSVerifierBindsHandoffDeviceAndPortalDevice(t *testing.T) {
+	for _, tc := range []struct {
+		name, portalDevice, want string
+	}{
+		{name: "matching device", portalDevice: legacyTestDeviceID, want: `type="complete"`},
+		{name: "mismatching device", portalDevice: "dev_zyxwvutsrqponmlkjihgfedcba", want: "Sign-in failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			portal := &auth.MockVerifier{}
+			portal.Set("user", "password", tc.portalDevice)
+			srv := cstp.NewServer(cstp.Config{
+				Verifier:   verifierForMode(modeUDS, portal),
+				ServerName: "localhost",
+				RandRead: func(p []byte) (int, error) {
+					for i := range p {
+						p[i] = byte(i + 1)
+					}
+					return len(p), nil
+				},
+			})
+			serve := func(path, body string) *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodPost, "https://localhost"+path, strings.NewReader(body))
+				// Inject exactly what udsserve's handoff middleware injects
+				// for the token-derived Subject DN CN.
+				req = req.WithContext(certctx.WithDeviceID(context.Background(), legacyTestDeviceID))
+				rec := httptest.NewRecorder()
+				srv.ServeHTTP(rec, req)
+				return rec
+			}
+
+			init := serve("/", `<config-auth client="vpn" type="init"/>`)
+			if init.Code != http.StatusOK {
+				t.Fatalf("init status = %d", init.Code)
+			}
+			opaque := legacyOpaqueID(init.Body.String())
+			if opaque == "" {
+				t.Fatal("init response did not contain an opaque session ID")
+			}
+			username := serve("/auth", legacyAuthReply(opaque, "user", ""))
+			if username.Code != http.StatusOK {
+				t.Fatalf("username status = %d", username.Code)
+			}
+			password := serve("/auth", legacyAuthReply(opaque, "", "password"))
+			if password.Code != http.StatusOK || !strings.Contains(password.Body.String(), tc.want) {
+				t.Fatalf("password response = status %d body %q, want %q", password.Code, password.Body.String(), tc.want)
+			}
+		})
+	}
+}
+
+func TestVerifierForModeBindsDeviceInAllModes(t *testing.T) {
 	raw := &auth.MockVerifier{}
 
-	legacy, ok := verifierForMode(modeLegacy, raw).(certBoundVerifier)
-	if !ok {
-		t.Fatal("legacy verifier is not certificate-bound")
-	}
-	if legacy.inner != raw {
-		t.Fatal("legacy verifier does not wrap the raw portal verifier")
-	}
-
-	uds := verifierForMode(modeUDS, raw)
-	if uds != raw {
-		t.Fatal("UDS verifier was globally wrapped; want the raw portal verifier")
+	for _, tc := range []struct {
+		name string
+		mode listenerMode
+	}{
+		{name: "legacy", mode: modeLegacy},
+		{name: "uds", mode: modeUDS},
+	} {
+		bound, ok := verifierForMode(tc.mode, raw).(certBoundVerifier)
+		if !ok {
+			t.Fatalf("%s verifier is not device-bound", tc.name)
+		}
+		if bound.inner != raw {
+			t.Fatalf("%s verifier does not wrap the raw portal verifier", tc.name)
+		}
 	}
 }
 

@@ -12,10 +12,11 @@ import (
 // The fields mirror the AnyConnect-CSTP row of the Stage 1 spec §7 plus
 // the universally-mandatory TraceID and SpecVersion.
 type HandoffInfo struct {
-	// DeviceID is the device UUID extracted from the MTLS Subject DN's CN
-	// field (RFC 4514 form). The facade has already validated the
-	// client-cert chain; this is the trust-anchor identifier era-ocserv
-	// uses for cross-check against the password-verify response.
+	// DeviceID is the era-portal device UUID from `ERA_TLV_DEVICE_ID`
+	// (a facade-derived UUIDv5). It is for diagnostics only and is NOT the
+	// binding trust anchor. The binding uses the idgen device id (dev_...)
+	// parsed from SubjectDN's CN, which the middleware places in certctx and
+	// certBoundVerifier compares against the password-verify response.
 	DeviceID string
 
 	// SubjectDN is the raw RFC 4514 Subject DN from
