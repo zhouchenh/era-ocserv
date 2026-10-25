@@ -475,11 +475,14 @@ type certBoundVerifier struct {
 	inner auth.PasswordVerifier
 }
 
-func verifierForMode(mode listenerMode, verifier auth.PasswordVerifier) auth.PasswordVerifier {
-	if mode == modeLegacy {
-		return certBoundVerifier{inner: verifier}
-	}
-	return verifier
+// verifierForMode binds the authenticated portal credential to the transport
+// device in every listener mode: legacy from the verified client-cert CN, UDS
+// from the facade's token-derived MTLS Subject DN CN placed in certctx by
+// internal/udsserve's middleware. A credential belonging to a different device
+// than the token's device is rejected as bad credentials. Wrapping is
+// unconditional so an unknown mode fails closed (no certctx device ID).
+func verifierForMode(_ listenerMode, verifier auth.PasswordVerifier) auth.PasswordVerifier {
+	return certBoundVerifier{inner: verifier}
 }
 
 func (v certBoundVerifier) Verify(ctx context.Context, username, password string) (string, error) {
@@ -563,9 +566,11 @@ func sharedEdgeDTLSBindingSource(r *http.Request, id cstp.Identity) (cstp.DTLSBi
 	var token [12]byte
 	copy(token[:], info.Token)
 	// The DTLS data path (internal/dtlsuds) re-resolves the device from the
-	// binding's Subject DN CN. On the AnyConnect password path the facade holds
-	// no client cert and forwards a PLACEHOLDER Subject DN (e.g.
-	// CN=dev_aaaa...26), which is not a real device — resolving it fails with
+	// binding's Subject DN CN. On the tokened auth path the facade forwards
+	// CN=<snapshot tpm_device_id>, which is authoritative and is bound to the
+	// portal credential by certBoundVerifier. Only the token-less
+	// CONNECT /CSCOSSLC/tunnel control path carries a PLACEHOLDER sentinel DN
+	// (CN=dev_aaaa...26) that is not a real device; resolving it fails with
 	// "device not found in TPM". Carry the REAL resolved device id here instead:
 	// it is the exact value the TPM resolver and the CSTP path (connect.go) key
 	// on. Fall back to the forwarded DN only if the resolved id is unset.
