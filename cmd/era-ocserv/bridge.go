@@ -13,6 +13,7 @@ import (
 	"github.com/zhouchenh/era-ocserv/internal/clatxlat"
 	"github.com/zhouchenh/era-ocserv/internal/cstp"
 	"github.com/zhouchenh/era-ocserv/internal/dtlsuds"
+	"github.com/zhouchenh/era-ocserv/internal/logredact"
 	"github.com/zhouchenh/era-ocserv/internal/tun"
 )
 
@@ -270,6 +271,13 @@ func (b *bridge) writeClientToTun(xlat *clatxlat.Translator, pkt []byte) {
 	}
 }
 
+// logCSTPConnected emits the CSTP connect line. The session token is a
+// long-lived bearer credential, so only its logredact.Fingerprint is logged
+// (session_fp), never the raw value.
+func logCSTPConnected(logger *slog.Logger, deviceID string, inner, clat netip.Addr, sessionID string) {
+	logger.Info("cstp client connected", "device", deviceID, "inner", inner, "clat", clat, "session_fp", logredact.Fingerprint(sessionID))
+}
+
 // pumpTunnel registers a freshly-accepted CSTP tunnel under its /128 (and the
 // device's CLAT /128 when present) and pumps inbound IP packets into the tun
 // device for the lifetime of the tunnel, translating the client's inner v4
@@ -314,7 +322,7 @@ func (b *bridge) pumpTunnel(ctx context.Context, t *cstp.Tunnel) {
 	}
 	b.installCLAT(ac, inner, clatV6)
 	xlat := ac.translator()
-	slog.Info("cstp client connected", "device", id.DeviceID, "inner", inner, "clat", clatV6, "session", t.SessionID())
+	logCSTPConnected(slog.Default(), id.DeviceID, inner, clatV6, t.SessionID())
 
 	defer func() {
 		ac.mu.Lock()
